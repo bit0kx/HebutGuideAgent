@@ -1,0 +1,21 @@
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+  external_labels:
+    cluster: echomind
+    environment: production
+
+scrape_configs:
+  - job_name: echomind-app
+    static_configs:
+      - targets:
+          - echomind:8000
+        labels:
+          service: echomind
+    scrape_interval: 10s
+    metrics_path: /metrics
+
+  - job_name: prometheus
+    static_configs:
+      - targets:
+          - localhost:9090

@@ -1,0 +1,36 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+
+# Env files
+.env
+.env.*
+!.env.example
+
+# Runtime data
+data/
+logs/
+model-cache/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Local DB / cache
+*.sqlite3
+
+# Backup
+*~
+*.bak
+docker-compose(1).yml
