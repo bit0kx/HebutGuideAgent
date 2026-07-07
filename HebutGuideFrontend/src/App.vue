@@ -144,6 +144,7 @@
               <input type="file" accept=".txt,.md,.json" @change="handleUpload" />
             </label>
           </div>
+          <p v-if="docNotice.message" :class="['notice', docNotice.type]">{{ docNotice.message }}</p>
         </article>
       </section>
     </section>
@@ -177,6 +178,7 @@ const searchQuery = ref('河北工业大学转专业政策')
 const searchResults = ref([])
 const docTitle = ref('河北工业大学招生补充说明')
 const docContent = ref('考生咨询录取风险时，应结合省份、科类、分数、位次和目标专业综合判断，最终以学校招生网和省考试院公布信息为准。')
+const docNotice = reactive({ type: 'muted', message: '' })
 const messageList = ref(null)
 
 const currentBackend = computed(() => backendMeta(settings.backend, settings))
@@ -291,14 +293,17 @@ async function searchKnowledge() {
 
 async function submitKnowledge() {
   busy.value = true
+  setDocNotice('muted', '正在添加文档...')
   try {
     const data = await addKnowledge(settings.backend, settings, [
       { title: docTitle.value.trim(), content: docContent.value.trim() }
     ])
     statusText.value = JSON.stringify(data, null, 2)
+    setDocNotice('success', knowledgeNoticeText(data, '文档添加成功'))
     await loadStats()
   } catch (error) {
     statusText.value = error.message
+    setDocNotice('error', `添加失败：${error.message}`)
   } finally {
     busy.value = false
   }
@@ -309,14 +314,57 @@ async function handleUpload(event) {
   event.target.value = ''
   if (!file) return
   busy.value = true
+  setDocNotice('muted', `正在上传 ${file.name}...`)
   try {
+    await previewKnowledgeFile(file)
     const data = await uploadKnowledge(settings.backend, settings, file)
     statusText.value = JSON.stringify(data, null, 2)
+    setDocNotice('success', knowledgeNoticeText(data, '文件上传并导入成功'))
     await loadStats()
   } catch (error) {
     statusText.value = error.message
+    setDocNotice('error', `上传失败：${error.message}`)
   } finally {
     busy.value = false
   }
+}
+
+async function previewKnowledgeFile(file) {
+  const text = await file.text()
+  const filename = file.name || 'unknown'
+  const baseTitle = filename.includes('.') ? filename.replace(/\.[^.]+$/, '') : filename
+
+  if (filename.toLowerCase().endsWith('.json')) {
+    const docs = JSON.parse(text)
+    if (!Array.isArray(docs)) {
+      throw new Error('JSON 文件应为数组格式: [{title, content}, ...]')
+    }
+    const firstDoc = docs.find((item) => item && typeof item === 'object')
+    docTitle.value = firstDoc?.title || baseTitle
+    docContent.value = firstDoc?.content || text
+    return
+  }
+
+  docTitle.value = baseTitle
+  docContent.value = text
+}
+
+function setDocNotice(type, message) {
+  docNotice.type = type
+  docNotice.message = message
+}
+
+function knowledgeNoticeText(data, fallback) {
+  const added = data?.added_chunks ?? data?.addedChunks
+  const total = data?.total_chunks ?? data?.totalChunks
+  const cacheCleared = data?.cache_cleared ?? data?.cacheCleared
+  const cacheText = cacheCleared != null ? `，已刷新 ${cacheCleared} 条检索缓存` : ''
+  if (added != null && total != null) {
+    return `${fallback}，新增 ${added} 个片段，当前共 ${total} 个片段${cacheText}。`
+  }
+  if (added != null) {
+    return `${fallback}，新增 ${added} 个片段${cacheText}。`
+  }
+  return data?.message || fallback
 }
 </script>

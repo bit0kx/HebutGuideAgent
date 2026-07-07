@@ -93,30 +93,65 @@ class KnowledgeBase:
 
     def search(self, query: str, top_k: int = 5) -> List[Dict[str, Any]]:
         """
-        语义检索：根据 query 返回最相关的文档片段。
+        混合检索：根据 query 返回最相关的文档片段。
 
-        ChromaDB 内部自动将 query 转为向量，与存储的文档向量做余弦相似度匹配。
+        ChromaDB 向量检索负责语义召回；本地关键词召回补足中文简称、学院名、
+        专业名等精确词命中，避免“材料学院”这类查询被弱相关泛化文档挤到前面。
         """
+        query = (query or "").strip()
+        if not query:
+            return []
+
+        total = self.doc_count
+        if total <= 0:
+            return []
+
+        recall_k = min(max(top_k * 4, 20), total)
         results = self._collection.query(
             query_texts=[query],
-            n_results=top_k,
+            n_results=recall_k,
         )
 
-        items = []
+        by_key: Dict[str, Dict[str, Any]] = {}
         if results["documents"] and results["documents"][0]:
-            for doc, meta, dist in zip(
+            for doc_id, doc, meta, dist in zip(
+                results["ids"][0],
                 results["documents"][0],
                 results["metadatas"][0],
                 results["distances"][0],
             ):
-                items.append({
-                    "title":    meta.get("title", ""),
-                    "content":  doc,
-                    "score":    round(1.0 - dist, 4),  # ChromaDB 返回距离，转为相似度
-                    "chunk":    meta.get("chunk_index", 0),
-                })
+                vector_score = round(1.0 - dist, 4)  # ChromaDB 返回距离，转为相似度
+                self._merge_search_item(
+                    by_key,
+                    doc_id,
+                    title=meta.get("title", ""),
+                    content=doc,
+                    chunk=meta.get("chunk_index", 0),
+                    vector_score=vector_score,
+                    lexical_score=self._lexical_score(query, meta.get("title", ""), doc),
+                )
 
-        return items
+        for doc_id, doc, meta in self._lexical_candidates(query):
+            self._merge_search_item(
+                by_key,
+                doc_id,
+                title=meta.get("title", ""),
+                content=doc,
+                chunk=meta.get("chunk_index", 0),
+                vector_score=None,
+                lexical_score=self._lexical_score(query, meta.get("title", ""), doc),
+            )
+
+        items = sorted(
+            by_key.values(),
+            key=lambda item: (
+                item.get("hybrid_score", item.get("score", 0.0)),
+                item.get("lexical_score", 0.0),
+                item.get("score", 0.0),
+            ),
+            reverse=True,
+        )
+        return items[:top_k]
 
     @property
     def doc_count(self) -> int:
@@ -164,6 +199,101 @@ class KnowledgeBase:
             chunks.append(current)
 
         return chunks
+
+    def _merge_search_item(
+        self,
+        by_key: Dict[str, Dict[str, Any]],
+        doc_id: str,
+        *,
+        title: str,
+        content: str,
+        chunk: int,
+        vector_score: Optional[float],
+        lexical_score: float,
+    ) -> None:
+        key = doc_id or hashlib.md5(f"{title}\n{content}".encode()).hexdigest()
+        current = by_key.get(key)
+        score = vector_score if vector_score is not None else 0.0
+        hybrid_score = max(score, lexical_score)
+        item = {
+            "title": title,
+            "content": content,
+            "score": round(hybrid_score, 4),
+            "vector_score": score,
+            "lexical_score": round(lexical_score, 4),
+            "chunk": chunk,
+        }
+        if current is None or item["score"] > current.get("score", 0.0):
+            by_key[key] = item
+
+    def _lexical_candidates(self, query: str) -> List[tuple[str, str, Dict[str, Any]]]:
+        """返回标题/正文与查询词有直接命中的候选片段。"""
+        try:
+            data = self._collection.get(include=["documents", "metadatas"])
+        except Exception as ex:
+            logger.warning(f"知识库关键词召回失败: {ex}")
+            return []
+
+        candidates = []
+        ids = data.get("ids", [])
+        docs = data.get("documents", [])
+        metas = data.get("metadatas", [])
+        for doc_id, doc, meta in zip(ids, docs, metas):
+            if self._lexical_score(query, meta.get("title", ""), doc) > 0:
+                candidates.append((doc_id, doc, meta))
+        return candidates
+
+    @classmethod
+    def _lexical_score(cls, query: str, title: str, content: str) -> float:
+        """中文招生知识库关键词打分，标题命中优先。"""
+        q = cls._compact(query)
+        if not q:
+            return 0.0
+
+        title_text = cls._compact(title)
+        content_text = cls._compact(content)
+        terms = cls._query_terms(q)
+        score = 0.0
+
+        if q in title_text:
+            score += 1.2
+        if q in content_text:
+            score += 0.8
+
+        for term in terms:
+            if not term:
+                continue
+            if term in title_text:
+                score += 0.55
+            if term in content_text:
+                score += 0.25
+
+        if q.endswith("学院"):
+            base = q[:-2]
+            if base and base in title_text and "学院" in title_text:
+                score += 1.0
+            if base and base in content_text and "学院" in content_text:
+                score += 0.55
+
+        return min(score, 3.0)
+
+    @staticmethod
+    def _compact(value: str) -> str:
+        return "".join(str(value or "").lower().split())
+
+    @staticmethod
+    def _query_terms(query: str) -> List[str]:
+        terms = [query]
+        suffixes = ["学院", "专业", "系", "类"]
+        for suffix in suffixes:
+            if query.endswith(suffix) and len(query) > len(suffix):
+                terms.append(query[:-len(suffix)])
+
+        for size in (4, 3, 2):
+            if len(query) > size:
+                terms.extend(query[i:i + size] for i in range(0, len(query) - size + 1))
+
+        return list(dict.fromkeys(term for term in terms if len(term) >= 2))
 
     def _load_default_docs(self) -> None:
         """导入默认知识库文档（大学报考咨询场景常见问题）。"""

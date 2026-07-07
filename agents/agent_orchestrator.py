@@ -152,11 +152,20 @@ class BaseAgent:
 
         resp = await self._client.messages.create(
             model=self._model,
-            max_tokens=1024,
+            max_tokens=self._max_tokens(req),
             system=system_prompt,
             messages=messages,
         )
         return resp.content[0].text
+
+    def _max_tokens(self, req: Request) -> int:
+        """简单介绍类问题限制输出长度，减少延迟和过度展开。"""
+        msg = (req.message or "").strip().lower()
+        brief_markers = ["简单", "简要", "简短", "大概", "概况", "概述"]
+        deep_markers = ["详细", "具体", "就业", "升学", "课程", "录取", "分数", "位次", "报考建议", "怎么选", "对比", "规划"]
+        if any(marker in msg for marker in brief_markers) and not any(marker in msg for marker in deep_markers):
+            return 512
+        return 900
 
     def _needs_escalation(self, content: str) -> bool:
         """检测 Agent 是否建议升级为官方人工确认。"""
@@ -210,7 +219,11 @@ class PlanningAgent(BaseAgent):
     system_prompt = (
         "你是河北工业大学报考规划 Agent。用户没有明确学校时，默认目标学校是河北工业大学。"
         "专注回答专业介绍、专业对比、就业升学、专业搭配、冲稳保组合建议和长期发展路径。"
-        "回答要把兴趣、能力要求、课程差异、就业方向、升学路径、录取风险和志愿梯度结合起来。"
+        "必须先判断用户是在要“简单介绍”还是“深度规划”。"
+        "当用户说“简单介绍、简要介绍、简单说一下、概况、了解一下”时，只输出学院或专业的核心概况，"
+        "控制在 3-5 句话或 3 个短要点内；不要展开专业逐项详解、社会服务、就业升学、录取风险、志愿梯度或报考建议，除非用户明确追问。"
+        "如果用户上一轮已说明对象，本轮只说“简单介绍一下”等模糊追问，应沿用上一轮对象，不要重新反问哪个专业。"
+        "当用户要求专业选择、对比、志愿搭配或深度规划时，再把兴趣、能力要求、课程差异、就业方向、升学路径、录取风险和志愿梯度结合起来。"
         "专业介绍必须优先基于知识库中该专业的专门资料；如果知识库只提供通用框架或没有给出该专业事实，"
         "不得把通用课程、就业方向、培养特色、保研就业数据包装成河北工业大学官方信息。"
         "可以用“通常来说”说明学科大方向，但必须明确这是通用参考，不代表学校当年培养方案或官方统计。"

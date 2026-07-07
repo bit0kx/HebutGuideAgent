@@ -480,6 +480,34 @@ pre {
   line-height: 1.58;
 }
 
+.notice {
+  margin: 12px 0 0;
+  padding: 10px 12px;
+  border-radius: 7px;
+  font-size: 13px;
+  font-weight: 700;
+  line-height: 1.5;
+  border: 1px solid transparent;
+}
+
+.notice.success {
+  color: #0d6f4f;
+  background: #e7f7ef;
+  border-color: #b9e7cf;
+}
+
+.notice.error {
+  color: #a23535;
+  background: #fff0f0;
+  border-color: #f0c4c4;
+}
+
+.notice.muted {
+  color: #465569;
+  background: #eef4fb;
+  border-color: #d7e3ef;
+}
+
 .file-button {
   display: inline-grid;
   place-items: center;

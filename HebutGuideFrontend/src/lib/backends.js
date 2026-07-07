@@ -51,7 +51,7 @@ export async function requestKnowledgeStats(type, settings) {
 }
 
 export async function requestSearch(type, settings, query, topK = 5) {
-  const params = new URLSearchParams({ query, topK: String(topK) })
+  const params = new URLSearchParams({ query, top_k: String(topK) })
   return requestJson(backendMeta(type, settings).baseUrl, `/search?${params}`, { method: 'POST' })
 }
 

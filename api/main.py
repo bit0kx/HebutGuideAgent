@@ -218,7 +218,7 @@ async def lifespan(app: FastAPI):
         history: Optional[List[Dict[str, str]]] = None,
     ) -> str:
         intent_result = await recognizer.recognize(message, history=history)
-        knowledge_text, _ = await _build_knowledge_context(message, intent=intent_result.intent)
+        knowledge_text, _ = await _build_knowledge_context(message, history=history, intent=intent_result.intent)
         risk_text, _ = await _build_risk_context(message, history=history, intent=intent_result.intent)
         return "\n\n".join(part for part in [knowledge_text, risk_text] if part)
 
@@ -364,6 +364,7 @@ async def _build_orchestrator_request(
     intent_result = await recognizer.recognize(message, history=history)
     knowledge_text, knowledge_used = await _build_knowledge_context(
         message,
+        history=history,
         intent=intent_result.intent,
         tool_manager=tool_manager,
     )
@@ -397,6 +398,7 @@ async def _build_orchestrator_request(
 async def _build_knowledge_context(
     message: str,
     top_k: int = 3,
+    history: Optional[List[Dict[str, str]]] = None,
     *,
     intent=None,
     tool_manager=None,
@@ -409,16 +411,20 @@ async def _build_knowledge_context(
     manager = tool_manager or _tool_manager
     if manager is None:
         return "", False
-    if not _should_use_knowledge(message, intent=intent):
+    query = _build_knowledge_query(message, history)
+    if not _should_use_knowledge(query, intent=intent):
         return "", False
     try:
-        result = await manager.search_with_rewrite("knowledge_search", message, top_k=top_k)
+        simple_intro = _is_simple_intro_query(message)
+        effective_top_k = min(top_k, 2) if simple_intro else top_k
+        snippet_chars = 360 if simple_intro else 600
+        result = await manager.search_with_rewrite("knowledge_search", query, top_k=effective_top_k)
         if not result.success or not isinstance(result.data, list) or not result.data:
             return "", False
 
         parts = ["[知识库检索结果]"]
         used = False
-        for i, item in enumerate(result.data[:top_k], start=1):
+        for i, item in enumerate(result.data[:effective_top_k], start=1):
             if not isinstance(item, dict):
                 continue
             title = str(item.get("title", "未命名文档"))
@@ -427,10 +433,12 @@ async def _build_knowledge_context(
             if not content:
                 continue
             used = True
-            parts.append(f"{i}. 标题: {title}\n   相关度: {score}\n   内容: {content[:600]}")
+            parts.append(f"{i}. 标题: {title}\n   相关度: {score}\n   内容: {content[:snippet_chars]}")
 
         if not used:
             return "", False
+        if simple_intro:
+            parts.append("用户要求简单介绍：请只做简短概况，控制在 3-5 句话或 3 个要点内；不要展开报考建议、就业升学、录取风险、志愿梯度，除非用户继续追问。")
         parts.append("请优先依据以上知识库内容回答；如果知识库内容不足，应说明信息边界，并引导用户查看河北工业大学本科招生网或补充关键报考条件。")
         return "\n".join(parts), True
     except Exception as ex:
@@ -516,6 +524,48 @@ def _build_risk_query(message: str, history: Optional[List[Dict[str, str]]] = No
         user_messages.append(current)
 
     return "\n".join(user_messages[-4:])
+
+
+def _build_knowledge_query(message: str, history: Optional[List[Dict[str, str]]] = None) -> str:
+    """为知识库检索补全多轮追问主题，例如“简单介绍一下”沿用上一轮的材料学院。"""
+    current = (message or "").strip()
+    if not current:
+        return ""
+    if not _is_vague_followup(current):
+        return current
+
+    for item in reversed(history or []):
+        if str(item.get("role", "")).lower() != "user":
+            continue
+        previous = str(item.get("content", "")).strip()
+        if previous and previous != current and not _is_vague_followup(previous):
+            return f"{previous}\n{current}"
+    return current
+
+
+def _is_simple_intro_query(message: str) -> bool:
+    """识别只需要概况的轻量问题，避免 PlanningAgent 展开成长篇规划。"""
+    msg = (message or "").strip().lower()
+    if not msg:
+        return False
+    brief_markers = ["简单", "简要", "简短", "大概", "概况", "概述", "了解一下", "介绍一下"]
+    deep_markers = ["详细", "具体", "就业", "升学", "课程", "录取", "分数", "位次", "报考建议", "怎么选", "对比", "规划"]
+    return any(marker in msg for marker in brief_markers) and not any(marker in msg for marker in deep_markers)
+
+
+def _is_vague_followup(message: str) -> bool:
+    """识别缺少主题、需要依赖历史的问题。"""
+    msg = (message or "").strip().lower()
+    vague_set = {
+        "简单介绍一下", "简要介绍一下", "简单说一下", "简要说一下",
+        "介绍一下", "讲一下", "说一下", "简单介绍", "简单点",
+    }
+    if msg in vague_set:
+        return True
+    return _is_simple_intro_query(msg) and not any(
+        keyword in msg
+        for keyword in ["学院", "专业", "学校", "校区", "材料", "计算机", "电气", "机械", "化工", "人工智能", "软件"]
+    )
 
 
 def _intent_value(intent) -> str:
@@ -635,12 +685,15 @@ async def prometheus_metrics():
 @app.post("/search")
 async def search(query: str, top_k: int = 5):
     """
-    演示检索优化链路：查询改写 → 并行召回 → 重排 → Top-K。
-    展示 MCP 工具调用的核心亮点。
+    知识库检索调试接口：直接按用户输入查询知识库，便于验证导入文档是否命中。
     """
     if _tool_manager is None:
         raise HTTPException(503, "服务未就绪")
-    result = await _tool_manager.search_with_rewrite("knowledge_search", query, top_k=top_k)
+    result = await _tool_manager.call(
+        "knowledge_search",
+        {"query": query, "top_k": top_k},
+        use_cache=False,
+    )
     return {"query": query, "results": result.data, "reranked": result.reranked}
 
 
@@ -720,7 +773,13 @@ async def add_knowledge(body: BatchDocInput):
         raise HTTPException(503, "知识库未初始化")
     kb = tool.handler.__self__
     count = kb.add_documents([{"title": d.title, "content": d.content} for d in body.documents])
-    return {"message": f"成功导入 {count} 个文档片段", "added_chunks": count, "total_chunks": kb.doc_count}
+    cleared = _tool_manager.clear_cache("knowledge_search") if _tool_manager else 0
+    return {
+        "message": f"成功导入 {count} 个文档片段",
+        "added_chunks": count,
+        "total_chunks": kb.doc_count,
+        "cache_cleared": cleared,
+    }
 
 
 @app.post("/knowledge/upload", tags=["知识库"])
@@ -760,10 +819,12 @@ async def upload_knowledge(file: UploadFile = File(...)):
         docs = [{"title": title, "content": text}]
 
     count = kb.add_documents(docs)
+    cleared = _tool_manager.clear_cache("knowledge_search") if _tool_manager else 0
     return {
         "message": f"文件 {filename} 导入成功",
         "added_chunks": count,
         "total_chunks": kb.doc_count,
+        "cache_cleared": cleared,
     }
 
 

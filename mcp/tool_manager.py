@@ -146,6 +146,19 @@ class MCPToolManager:
     def unregister(self, name: str) -> None:
         self._tools.pop(name, None)
 
+    def clear_cache(self, name: Optional[str] = None) -> int:
+        """清理工具调用缓存；传入工具名时只清理该工具的缓存。"""
+        if name is None:
+            count = len(self._cache)
+            self._cache.clear()
+            return count
+
+        prefix = f"{name}:"
+        keys = [key for key in self._cache if key.startswith(prefix)]
+        for key in keys:
+            del self._cache[key]
+        return len(keys)
+
     # ── 核心调用 ──────────────────────────────────────────────────────────────
     # 对其他工具 比如 search_handler的进一步封装
     async def call(
