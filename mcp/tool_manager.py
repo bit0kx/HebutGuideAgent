@@ -253,11 +253,11 @@ class MCPToolManager:
         多角度子查询并行检索后合并，显著提升召回率。
 
         示例：
-          原始: "退款流程"
-          改写: ["如何申请退款", "退款需要多少天", "退款政策是什么"]
+          原始: "河北工业大学转专业政策"
+          改写: ["河北工业大学转专业申请条件", "河北工业大学转专业时间和限制", "河北工业大学各学院转专业接收要求"]
         """
-        prompt = f"""将以下用户查询改写为 {n} 个不同角度的搜索子查询，用于检索知识库。
-要求：每个子查询角度不同，覆盖原始问题的不同方面。
+        prompt = f"""将以下河北工业大学招生咨询查询改写为 {n} 个不同角度的搜索子查询，用于检索招生知识库。
+要求：每个子查询角度不同，覆盖原始问题的不同方面；优先围绕招生章程、专业介绍、历年录取成绩、招生计划、学费住宿、校园生活、就业升学等招生咨询场景。
 原始查询: "{query}"
 返回 JSON 数组，例如: ["子查询1", "子查询2", "子查询3"]"""
         prompt = self._clean_text(prompt)
@@ -305,7 +305,7 @@ class MCPToolManager:
         for r in results:
             if isinstance(r, ToolResult) and r.success and isinstance(r.data, list):
                 for item in r.data:
-                    key = hashlib.md5(str(item).encode()).hexdigest()
+                    key = self._dedupe_key(item)
                     if key not in seen:
                         seen.add(key)
                         merged.append(item)
@@ -316,6 +316,21 @@ class MCPToolManager:
         # 4. 重排：用 LLM 对合并结果按相关性打分，取 Top-K
         reranked = await self._rerank(query, merged, top_k)
         return ToolResult(success=True, data=reranked, tool_name=tool_name, reranked=True)
+
+    @staticmethod
+    def _dedupe_key(item: Any) -> str:
+        """
+        检索结果去重 key。
+
+        knowledge_search 返回 dict 时，只按 title + content 去重，避免同一文档片段因为
+        score/chunk 等元数据不同而重复进入重排。非 dict 结果保留字符串兜底。
+        """
+        if isinstance(item, dict):
+            title = str(item.get("title", "")).strip()
+            content = str(item.get("content", "")).strip()
+            if title or content:
+                return hashlib.md5(f"{title}\n{content}".encode()).hexdigest()
+        return hashlib.md5(str(item).encode()).hexdigest()
 
     # ── 结果重排（解决召回不好）──────────────────────────────────────────────
 

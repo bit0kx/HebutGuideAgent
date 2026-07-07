@@ -1,11 +1,12 @@
-services:
-  echomind-frontend:
+﻿services:
+  hebutguide-frontend:
     build:
       context: .
       dockerfile: Dockerfile
-    container_name: echomind-frontend
+    container_name: hebutguide-frontend
     ports:
       - "5174:80"
     extra_hosts:
       - "host.docker.internal:host-gateway"
     restart: unless-stopped
+

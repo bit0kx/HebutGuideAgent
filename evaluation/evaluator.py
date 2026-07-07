@@ -1,4 +1,4 @@
-"""
+﻿"""
 亮点：端到端 Agent 评测框架
 
 核心问题：如何评测端到端 Agent？
@@ -21,7 +21,7 @@ import statistics
 import time
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Protocol
 
 from core.intent_recognizer import IntentCategory, IntentRecognizer
 from core.llm_client import create_llm_client
@@ -75,6 +75,15 @@ class EvalReport:
     results:          List[EvalResult]
 
 
+class ContextBuilder(Protocol):
+    async def __call__(
+        self,
+        message: str,
+        history: Optional[List[Dict[str, str]]] = None,
+    ) -> str:
+        ...
+
+
 # ── LLM-as-Judge ─────────────────────────────────────────────────────────────
 
 class LLMJudge:
@@ -89,17 +98,23 @@ class LLMJudge:
     注意：LLM Judge 本身也有偏差，建议定期用人工标注校准。
     """
 
-    JUDGE_PROMPT = """你是一个客服质量评估专家。请对以下客服响应进行评分。
+    JUDGE_PROMPT = """你是一个大学招生咨询质量评估专家。请对以下招生 Agent 响应进行评分。
 
 用户问题: {question}
 Agent 响应: {response}
 {context_section}
 
 请从以下四个维度评分（0.0-1.0），返回 JSON：
-- relevance: 响应是否直接针对用户问题（0=完全无关，1=完全相关）
-- accuracy: 信息是否准确无误（0=明显错误，1=完全正确）
-- completeness: 是否完整解决了用户需求（0=完全没解决，1=完全解决）
-- helpfulness: 用户能否据此采取行动（0=毫无帮助，1=非常有帮助）
+- relevance: 响应是否直接针对考生或家长的问题（0=完全无关，1=完全相关）
+- accuracy: 信息是否准确，是否优先依据知识库、MCP 工具结果或官方口径，是否避免编造录取结论（0=明显错误，1=完全可靠）
+- completeness: 是否覆盖招生咨询所需关键条件，例如省份、科类/选科、分数、位次、专业、年份、政策边界（0=严重缺失，1=完整充分）
+- helpfulness: 用户能否据此采取下一步行动，例如补充位次、查看招生章程、查询招生网、配置冲稳保方案（0=毫无帮助，1=非常有帮助）
+
+额外要求：
+- 对录取概率、分数位次、招生计划等问题，不能因为回答谨慎就扣分；只要说明依据和不确定性，应视为更可靠。
+- 如果信息不足，Agent 主动追问省份、科类、分数、位次或目标专业，应视为有帮助。
+- 如果 Agent 承诺“一定录取”、编造数据、混用不同省份数据，应降低 accuracy 分数。
+- 如果响应出现“假设工具返回”“假设数据”“XXX/YYY”等占位或伪造检索结果，accuracy 必须不高于 0.2，completeness 必须不高于 0.4。
 
 只返回 JSON，例如: {{"relevance": 0.9, "accuracy": 0.8, "completeness": 0.7, "helpfulness": 0.85}}"""
 
@@ -113,6 +128,16 @@ Agent 响应: {response}
         response: str,
         context: Optional[str] = None,
     ) -> QualityScores:
+        violation = self._hard_violation(response)
+        if violation:
+            return QualityScores(
+                relevance=0.8,
+                accuracy=0.0,
+                completeness=0.2,
+                helpfulness=0.2,
+                error=violation,
+            )
+
         ctx_section = f"背景信息: {context}" if context else ""
         prompt = self.JUDGE_PROMPT.format(
             question=question,
@@ -151,6 +176,25 @@ Agent 响应: {response}
             value = str(value)
         return value.encode("utf-8", errors="ignore").decode("utf-8")
 
+    @staticmethod
+    def _hard_violation(response: str) -> str:
+        text = response or ""
+        forbidden = [
+            "假设工具返回",
+            "假设工具",
+            "假设数据",
+            "假设返回",
+            "假设我们有以下数据",
+            "（假设",
+            "(假设",
+            "XXX",
+            "YYY",
+        ]
+        for marker in forbidden:
+            if marker in text:
+                return f"响应包含伪造或占位数据标记: {marker}"
+        return ""
+
 
 # ── 意图识别评测 ──────────────────────────────────────────────────────────────
 
@@ -165,7 +209,8 @@ class IntentEvaluator:
         case_details: List[Dict[str, Any]] = []
 
         for case in cases:
-            result = await self._recognizer.recognize(case.message)
+            history = self._context_to_history(case.context)
+            result = await self._recognizer.recognize(case.message, history=history)
             predicted = result.intent.value
             predictions.append(predicted)
             ground_truth.append(case.expected_intent)
@@ -175,6 +220,7 @@ class IntentEvaluator:
                 "predicted": predicted,
                 "confidence": result.confidence,
                 "reasoning": result.reasoning,
+                "history": history or [],
             })
 
         # 纯 Python 计算指标
@@ -204,6 +250,48 @@ class IntentEvaluator:
             "cases":      case_details,
         }
 
+    @staticmethod
+    def _context_to_history(context: Optional[Dict[str, Any]]) -> Optional[List[Dict[str, str]]]:
+        """
+        将 IntentTestCase.context 转成 IntentRecognizer 可用的多轮 history。
+
+        支持几种常见写法：
+        - {"history": [{"role": "user", "content": "..."}]}
+        - {"recent_messages": [{"role": "assistant", "content": "..."}]}
+        - {"turns": ["第一轮用户消息", "第二轮用户消息"]}
+        """
+        if not context:
+            return None
+
+        raw_history = (
+            context.get("history")
+            or context.get("recent_messages")
+            or context.get("messages")
+        )
+        history: List[Dict[str, str]] = []
+
+        if isinstance(raw_history, list):
+            for item in raw_history:
+                if isinstance(item, dict):
+                    role = str(item.get("role") or "user").strip().lower()
+                    content = str(item.get("content") or item.get("message") or "").strip()
+                else:
+                    role = "user"
+                    content = str(item).strip()
+                if role not in {"user", "assistant", "system"}:
+                    role = "user"
+                if content:
+                    history.append({"role": role, "content": content})
+
+        turns = context.get("turns")
+        if isinstance(turns, list):
+            for item in turns:
+                content = str(item).strip()
+                if content:
+                    history.append({"role": "user", "content": content})
+
+        return history or None
+
 
 # ── 端到端评测器 ──────────────────────────────────────────────────────────────
 
@@ -229,6 +317,7 @@ class EndToEndEvaluator:
         base_url: Optional[str] = None,
         model:    str = "claude-3-5-sonnet-20241022",
         baseline_path: Optional[str] = None,
+        context_builder: Optional[ContextBuilder] = None,
     ):
         client = create_llm_client(api_key=api_key, base_url=base_url, model=model)
 
@@ -238,6 +327,7 @@ class EndToEndEvaluator:
         self._history:         List[EvalReport] = []
         self._baseline_path = pathlib.Path(baseline_path) if baseline_path else None
         self._baseline: Optional[EvalReport] = self._load_baseline()
+        self._context_builder = context_builder
 
     async def run(
         self,
@@ -328,7 +418,12 @@ class EndToEndEvaluator:
         results: List[EvalResult] = []
 
         for turn_idx, question in enumerate(questions):
-            context = self._history_context(history)
+            history_context = self._history_context(history)
+            domain_context = await self._build_domain_context(
+                question,
+                history=history[-6:] if history else None,
+            )
+            context = "\n\n".join(part for part in [history_context, domain_context] if part)
             orch_req = OrcReq(
                 message=question,
                 user_id=user_id,
@@ -371,6 +466,20 @@ class EndToEndEvaluator:
 
         return results
 
+    async def _build_domain_context(
+        self,
+        question: str,
+        history: Optional[List[Dict[str, str]]] = None,
+    ) -> str:
+        """为评测对话补充与 /chat 主链路一致的领域上下文。"""
+        if self._context_builder is None:
+            return ""
+        try:
+            return await self._context_builder(question, history=history)
+        except Exception as ex:
+            logger.warning(f"构建评测领域上下文失败: {ex}")
+            return ""
+
     @staticmethod
     def _dialog_turns(case: Dict[str, Any]) -> List[str]:
         turns = case.get("turns")
@@ -409,15 +518,17 @@ class EndToEndEvaluator:
     ) -> List[str]:
         recs = []
         if scores.get("intent_accuracy", 1.0) < 0.90:
-            recs.append("意图识别准确率 < 90%：增加 Few-shot 示例，或对低 F1 的意图类别补充训练数据")
+            recs.append("意图识别准确率 < 90%：补充招生场景 Few-shot，重点覆盖分数风险、专业咨询、录取政策、校园生活等类别")
         if scores.get("relevance", 1.0) < 0.75:
-            recs.append("相关性偏低：检查 Agent system_prompt，确保 Agent 聚焦于用户问题")
+            recs.append("相关性偏低：检查招生 Agent system_prompt，确保回答聚焦于考生问题和目标学校信息")
+        if scores.get("accuracy", 1.0) < 0.75:
+            recs.append("准确性偏低：检查 RAG 知识库、risk_assessment 工具数据和回答中的官方口径约束，避免编造录取结论")
         if scores.get("completeness", 1.0) < 0.75:
-            recs.append("完整性偏低：Agent 可能过早结束回答，考虑在 prompt 中要求提供完整解决方案")
+            recs.append("完整性偏低：分数位次类问题应覆盖省份、科类、分数、位次、专业、年份和不确定性说明")
         if scores.get("helpfulness", 1.0) < 0.75:
-            recs.append("有用性偏低：回答可能过于抽象，考虑要求 Agent 提供具体操作步骤")
+            recs.append("有用性偏低：回答应给出下一步行动，例如补充位次、查询招生网、联系招生办或配置冲稳保方案")
         if not recs:
-            recs.append("所有指标均达标，继续保持")
+            recs.append("招生咨询评测指标均达标，继续保持")
         return recs
 
     @property
@@ -473,20 +584,49 @@ class EndToEndEvaluator:
 # ── 内置测试用例（开箱即用）──────────────────────────────────────────────────
 
 DEFAULT_INTENT_CASES: List[IntentTestCase] = [
-    IntentTestCase("我的订单什么时候到？",       "query"),
-    IntentTestCase("帮我取消订单",               "request"),
-    IntentTestCase("你们服务太差了！",            "complaint"),
-    IntentTestCase("应用一直报500错误",           "technical"),
-    IntentTestCase("为什么扣了两次款？",          "billing"),
-    IntentTestCase("我要投诉，转人工！",          "escalation"),
-    IntentTestCase("你好",                        "greeting"),
-    IntentTestCase("修改我的邮箱地址",            "account"),
+    IntentTestCase("这个学校在哪个城市？", "school_info"),
+    IntentTestCase("河北工业大学是 211 吗？", "school_info"),
+    IntentTestCase("计算机专业学什么？", "major_info"),
+    IntentTestCase("我河南理科580分能报吗？", "score_risk"),
+    IntentTestCase("我河北物理类620分，位次9000，报计算机稳吗？", "score_risk"),
+    IntentTestCase("转专业政策是什么？", "admission_policy"),
+    IntentTestCase("服从调剂会被退档吗？", "admission_policy"),
+    IntentTestCase("宿舍条件怎么样？", "campus_life"),
+    IntentTestCase("学费和住宿费是多少？", "tuition"),
+    IntentTestCase("这个专业就业前景如何？", "career"),
+    IntentTestCase("软件工程和人工智能怎么选？", "comparison"),
+    IntentTestCase("你好，我想咨询报考", "admission_policy"),
+    IntentTestCase(
+        message="那这个呢？",
+        expected_intent="score_risk",
+        context={
+            "history": [
+                {"role": "user", "content": "我是河北物理类620分，位次9000，想报计算机科学与技术，稳不稳？"},
+                {"role": "assistant", "content": "需要结合历年最低位次和当年计划判断。"},
+                {"role": "user", "content": "如果换成软件工程"},
+            ],
+        },
+    ),
+    IntentTestCase(
+        message="哪个更适合我？",
+        expected_intent="comparison",
+        context={
+            "history": [
+                {"role": "user", "content": "我比较看重就业，也想考研。"},
+                {"role": "assistant", "content": "可以比较软件工程和人工智能的课程、就业和升学路径。"},
+                {"role": "user", "content": "软件工程和人工智能这两个方向"},
+            ],
+        },
+    ),
 ]
 
 DEFAULT_DIALOG_CASES: List[Dict[str, Any]] = [
-    {"question": "我的订单 #12345 还没到，已经超时了"},
-    {"question": "应用登录一直报错 401"},
-    {"question": "为什么这个月多扣了 50 块钱？"},
-    {"question": "帮我把收货地址改成北京市朝阳区"},
-    {"turns": ["你好，我想退款", "订单号是 #12345", "退款多久能到账？"]},
+    {"question": "河北工业大学的优势专业有哪些？"},
+    {"question": "河北工业大学计算机科学与技术专业主要学什么？"},
+    {"question": "河北工业大学转专业政策是什么？"},
+    {"question": "天津考生631分、位次6375，报计算机科学与技术稳不稳？"},
+    {"turns": ["我是河南理科580分", "想报计算机", "稳不稳？"]},
+    {"turns": ["我是河北物理类620分，位次9000", "想报计算机科学与技术", "需要搭配什么稳妥专业吗？"]},
+    {"turns": ["我比较看重就业", "软件工程和人工智能怎么选？"]},
 ]
+

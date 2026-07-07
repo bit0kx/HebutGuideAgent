@@ -14,7 +14,10 @@ __pycache__
 !.env.example
 !.env.example.env
 
-data
+data/*
+!data/
+!data/hebut_hebei.xlsx
+!data/hebut_tianjin.xlsx
 logs
 backups
 wiki

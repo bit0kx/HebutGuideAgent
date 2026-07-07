@@ -6,20 +6,22 @@
 路由策略（三层决策）：
   1. 意图路由 —— 根据 IntentCategory 直接映射到专属 Agent
   2. 性能路由 —— 同类 Agent 有多个时，选成功率最高、延迟最低的
-  3. 降级路由 —— 专属 Agent 不可用时，自动降级到 GeneralAgent
+  3. 降级路由 —— 专属 Agent 不可用时，自动降级到 GeneralAdmissionsAgent
 
 并行协作：
-  - 复杂问题（如"技术问题 + 账单问题"）可同时派发给多个 Agent
+  - 默认只路由到一个主 Agent；只有明确多维问题才并行协作
   - 结果由 Orchestrator 合并后返回
 
 升级机制：
-  - Agent 置信度低于阈值 → 自动升级到更高级 Agent 或转人工
+  - Agent 置信度低或涉及官方口径 → 建议联系招生办公室或查看官方招生网
+  路由到 escalation 时，最终会降级到 GeneralAdmissionsAgent，同时 result.escalated=True。
+  这是合理的，因为当前系统没有人工坐席或工单系统，只做“升级标记 + 官方渠道提示”。
 """
 import asyncio
 import logging
 import time
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import Enum
 from typing import Any, Dict, List, Optional
 
@@ -32,11 +34,11 @@ logger = logging.getLogger(__name__)
 # ── 数据结构 ──────────────────────────────────────────────────────────────────
 
 class AgentType(Enum):
-    GENERAL   = "general"    # 通用客服
-    TECHNICAL = "technical"  # 技术支持
-    BILLING   = "billing"    # 账单/退款
-    ESCALATION = "escalation" # 人工升级（占位）
-
+    GENERAL = "general"     # 兜底、学校概况、校园生活、简单问答
+    POLICY = "policy"       # 招生章程、录取规则、调剂、退档、转专业、收费
+    RISK = "risk"           # 分数、位次、历年录取线、冲稳保分析
+    PLANNING = "planning"   # 专业介绍、专业对比、就业升学、志愿搭配
+    ESCALATION = "escalation"
 
 @dataclass
 class AgentStats:
@@ -77,6 +79,7 @@ class Request:
     user_id:     str
     conv_id:     str
     context:     str = ""        # 来自 MemoryManager 的格式化上下文
+    skills_context: str = ""     # 来自 SkillManager 的动态业务规则
     history:     Optional[List[Dict[str, str]]] = None  # 对话历史，传给意图识别
     intent:      Optional[IntentCategory] = None
     urgency:     Optional[UrgencyLevel]   = None
@@ -137,6 +140,10 @@ class BaseAgent:
         def _clean(s: str) -> str:
             return s.encode("utf-8", errors="ignore").decode("utf-8")
 
+        system_prompt = self.system_prompt
+        if req.skills_context:
+            system_prompt = f"{system_prompt}\n\n{_clean(req.skills_context)}"
+
         messages = []
         if req.context:
             messages.append({"role": "user", "content": f"[背景信息]\n{_clean(req.context)}"})
@@ -146,38 +153,69 @@ class BaseAgent:
         resp = await self._client.messages.create(
             model=self._model,
             max_tokens=1024,
-            system=self.system_prompt,
+            system=system_prompt,
             messages=messages,
         )
         return resp.content[0].text
 
     def _needs_escalation(self, content: str) -> bool:
-        """检测 Agent 是否建议升级（简单关键词检测）。"""
-        keywords = ["转人工", "人工客服", "escalate", "specialist", "无法处理"]
+        """检测 Agent 是否建议升级为官方人工确认。"""
+        keywords = [
+            "联系招生办", "招生办公室", "官方招生网", "人工确认",
+            "无法确认", "以学校公布为准", "以招生章程为准",
+            "escalate", "specialist", "无法处理",
+        ]
         return any(kw in content for kw in keywords)
 
 
-class GeneralAgent(BaseAgent):
-    agent_type    = AgentType.GENERAL
+class GeneralAdmissionsAgent(BaseAgent):
+    agent_type = AgentType.GENERAL
     system_prompt = (
-        "你是 EchoMind 智能客服。友好、简洁地回答用户问题。"
-        "如果问题超出你的能力范围，明确说明并建议转接专业客服。"
+        "你是 河北工业大学招生咨询助手，服务对象是有意向报考该校的考生和家长。"
+        "你可以回答学校情况、专业信息、录取政策、历年分数、就业前景、学费住宿和校园生活等问题。"
+        "回答必须优先依据知识库、对话上下文和工具结果；涉及具体年份、省份、科类、批次、专业、分数、位次时要明确条件。"
+        "不要承诺一定录取，不要编造官方数据。信息不足时，主动追问省份、科类、分数、位次、目标专业等关键信息。"
+        "涉及最终录取、收费、招生计划等官方口径时，提醒以学校招生网、当年招生章程和省级考试院公布信息为准。" \
+        "最后可以加一句推荐加入学长学姐答疑QQ群: 925926323（新生入学咨询群）获取更多校园信息。"
     )
 
 
-class TechnicalAgent(BaseAgent):
-    agent_type    = AgentType.TECHNICAL
+class PolicyAgent(BaseAgent):
+    agent_type = AgentType.POLICY
     system_prompt = (
-        "你是技术支持专家。专注于：故障排查、错误诊断、系统配置。"
-        "提供清晰的步骤化解决方案。遇到需要后台操作的问题，说明需要升级处理。"
+        "你是河北工业大学招生政策 Agent。用户没有明确学校时，默认目标学校是河北工业大学。"
+        "专注回答招生章程、录取规则、专业调剂、转专业、体检限制、投档和退档风险、学费住宿费、招生计划等问题。"
+        "必须强调政策具有年份差异，具体以当年本科招生章程、学校招生网和省级考试院文件为准。"
+        "遇到用户缺少省份、科类、批次或年份时，应先提示补充条件，再给出一般性解释。"
     )
 
 
-class BillingAgent(BaseAgent):
-    agent_type    = AgentType.BILLING
+class RiskAgent(BaseAgent):
+    agent_type = AgentType.RISK
     system_prompt = (
-        "你是账单服务专家。专注于：账单查询、退款申请、发票问题、订阅管理。"
-        "对财务问题保持准确和专业。涉及实际退款操作时，说明需要人工审核。"
+        "你是河北工业大学录取分数与风险分析 Agent。用户没有明确其他学校时，只评估河北工业大学。"
+        "专注处理分数、位次、历年录取线、招生计划、冲稳保判断。"
+        "你只能基于用户提供的省份、科类、分数、位次、目标专业，以及知识库或工具返回的历年数据进行解释。"
+        "如果工具结果为信息不足、无数据或未给出具体年份数据，不得编造分数、位次、年份或用 XXX/YYY、假设数据占位。"
+        "如果 MCP 录取风险评估状态不是 ok，只能追问缺失条件或说明当前无法自动判断，不能输出录取趋势和冲稳保结论。"
+        "工具给出历年数据时，必须优先引用工具中的年份、最低分、最低位次和风险判断。"
+        "不要说“请稍等，我将查询”或“假设工具返回”；如果上下文没有实际工具结果，就直接说明缺少信息或无法自动判断。"
+        "不得承诺一定录取，只能给出倾向性判断和依据，例如冲、稳、保、风险较高、需要结合位次进一步确认。"
+        "如果用户只给分数未给省份、科类或位次，应优先追问这些信息，不要泛泛推荐其他学校。"
+    )
+
+
+class PlanningAgent(BaseAgent):
+    agent_type = AgentType.PLANNING
+    system_prompt = (
+        "你是河北工业大学报考规划 Agent。用户没有明确学校时，默认目标学校是河北工业大学。"
+        "专注回答专业介绍、专业对比、就业升学、专业搭配、冲稳保组合建议和长期发展路径。"
+        "回答要把兴趣、能力要求、课程差异、就业方向、升学路径、录取风险和志愿梯度结合起来。"
+        "专业介绍必须优先基于知识库中该专业的专门资料；如果知识库只提供通用框架或没有给出该专业事实，"
+        "不得把通用课程、就业方向、培养特色、保研就业数据包装成河北工业大学官方信息。"
+        "可以用“通常来说”说明学科大方向，但必须明确这是通用参考，不代表学校当年培养方案或官方统计。"
+        "回答具体专业时，应区分“知识库已确认的信息”和“需以招生网、学院官网、当年培养方案确认的信息”。"
+        "不要反问“哪所大学”，除非用户明确表示要比较其他学校；不要承诺薪资、就业率或一定录取。"
     )
 
 
@@ -190,16 +228,30 @@ class AgentOrchestrator:
     路由逻辑（三层）：
       1. 意图 → Agent 类型映射
       2. 同类多实例时按 routing_score() 选最优
-      3. 专属 Agent 失败时降级到 GeneralAgent
+      3. 专属 Agent 失败时降级到 GeneralAdmissionsAgent
     """
 
-    # 意图 → Agent 类型的静态映射（路由表）
-    _INTENT_ROUTING: Dict[IntentCategory, AgentType] = {
-        IntentCategory.TECHNICAL:  AgentType.TECHNICAL,
-        IntentCategory.BILLING:    AgentType.BILLING,
-        IntentCategory.ACCOUNT:    AgentType.BILLING,
-        IntentCategory.ESCALATION: AgentType.ESCALATION,
-        # 其余意图 → GENERAL（默认）
+    # 意图值 → Agent 类型的静态映射（路由表）。
+    # 使用字符串是为了兼容当前旧版 IntentCategory，以及后续改造后的招生意图。
+    _INTENT_ROUTING: Dict[str, AgentType] = {
+        "school_info": AgentType.GENERAL,
+        "school_overview": AgentType.GENERAL,
+        "major_info": AgentType.PLANNING,
+        "admission_policy": AgentType.POLICY,
+        "score_risk": AgentType.RISK,
+        "tuition": AgentType.POLICY,
+        "tuition_scholarship": AgentType.POLICY,
+        "campus_life": AgentType.GENERAL,
+        "career": AgentType.PLANNING,
+        "career_prospect": AgentType.PLANNING,
+        "comparison": AgentType.PLANNING,
+        "escalation": AgentType.ESCALATION,
+        # 兼容外部调用方可能传入的泛化意图，统一收敛到招生咨询语义。
+        "query": AgentType.GENERAL,
+        "request": AgentType.GENERAL,
+        "policy": AgentType.POLICY,
+        "contact": AgentType.ESCALATION,
+        "complaint": AgentType.ESCALATION,
     }
 
     def __init__(
@@ -207,16 +259,19 @@ class AgentOrchestrator:
         api_key:  str,
         base_url: Optional[str] = None,
         model:    str = "claude-3-5-sonnet-20241022",
+        skill_manager: Optional[Any] = None,
     ):
         client = create_llm_client(api_key=api_key, base_url=base_url, model=model)
 
         self._intent_recognizer = IntentRecognizer(api_key=api_key, base_url=base_url, model=model)
+        self._skill_manager = skill_manager
 
         # Agent 池：每种类型可有多个实例（水平扩展）
         self._pool: Dict[AgentType, List[BaseAgent]] = {
-            AgentType.GENERAL:   [GeneralAgent(client, model)],
-            AgentType.TECHNICAL: [TechnicalAgent(client, model)],
-            AgentType.BILLING:   [BillingAgent(client, model)],
+            AgentType.GENERAL:   [GeneralAdmissionsAgent(client, model)],
+            AgentType.POLICY:    [PolicyAgent(client, model)],
+            AgentType.RISK:      [RiskAgent(client, model)],
+            AgentType.PLANNING:  [PlanningAgent(client, model)],
         }
 
     # ── 主入口 ────────────────────────────────────────────────────────────────
@@ -234,7 +289,7 @@ class AgentOrchestrator:
             req.intent  = intent_result.intent
             req.urgency = intent_result.urgency
 
-        # 复杂问题自动并行协作，例如同一句同时涉及登录故障和扣款/退款。
+        # 复杂问题自动并行协作，但默认只选择一个主 Agent，避免回答冗长重复。
         collaboration = self._collaboration_targets(req)
         # 如果是多个问题，需要多个 Agent 并行处理，就跳过 三层路由决策_route()
         if len(collaboration) > 1:
@@ -248,10 +303,10 @@ class AgentOrchestrator:
 
         # 4. 升级检查
         escalated = False
-        if response.escalate or req.urgency == UrgencyLevel.CRITICAL or req.intent == IntentCategory.ESCALATION:
+        if response.escalate or req.urgency == UrgencyLevel.CRITICAL or self._intent_value(req.intent) == "escalation":
             escalated = True
             logger.warning(f"请求 {req.request_id} 触发升级: urgency={req.urgency}")
-            # 生产环境：此处创建工单、通知人工客服
+            # 生产环境：此处可记录招生咨询请求、提示联系招生办公室或招生网官方渠道。
 
         return OrchestratorResult(
             request_id=req.request_id,
@@ -265,7 +320,7 @@ class AgentOrchestrator:
     async def run_parallel(self, req: Request, agent_types: List[AgentType]) -> OrchestratorResult:
         """
         并行派发给多个 Agent，合并结果。
-        适用于复杂问题（如同时涉及技术和账单）。
+        适用于复杂招生问题（如同时涉及分数风险、专业选择和就业前景）。
         """
         t0 = time.monotonic()
         tasks = [self._execute(req, at) for at in agent_types]
@@ -301,8 +356,9 @@ class AgentOrchestrator:
         if urgency == UrgencyLevel.CRITICAL:
             return AgentType.ESCALATION
 
-        if intent and intent in self._INTENT_ROUTING:
-            target = self._INTENT_ROUTING[intent]
+        intent_value = self._intent_value(intent)
+        if intent_value in self._INTENT_ROUTING:
+            target = self._INTENT_ROUTING[intent_value]
             # 如果目标类型有可用实例则使用，否则降级
             if target in self._pool and self._pool[target]:
                 return target
@@ -313,19 +369,31 @@ class AgentOrchestrator:
         """
         判断是否需要多个 Agent 并行协作。
 
-        意图识别通常只返回一个主意图；这里用领域关键词补充检测复合问题，
-        例如"登录报错且被重复扣款"需要技术和账单 Agent 同时处理。
+        意图识别通常只返回一个主意图；这里仅在用户明确提出多维需求时才补充协作 Agent，
+        例如"河南理科 580 分想报计算机，宿舍和就业怎么样"才需要多个 Agent 协作。
         """
         msg = req.message.lower()
         targets: List[AgentType] = []
 
-        technical_kws = ["崩溃", "报错", "error", "crash", "无法登录", "登录失败", "500", "401"]
-        billing_kws = ["退款", "扣款", "发票", "账单", "支付", "订阅", "refund", "invoice"]
+        intent_target = self._INTENT_ROUTING.get(self._intent_value(req.intent))
+        if intent_target and intent_target != AgentType.ESCALATION:
+            targets.append(intent_target)
 
-        if req.intent == IntentCategory.TECHNICAL or any(kw in msg for kw in technical_kws):
-            targets.append(AgentType.TECHNICAL)
-        if req.intent in (IntentCategory.BILLING, IntentCategory.ACCOUNT) or any(kw in msg for kw in billing_kws):
-            targets.append(AgentType.BILLING)
+        dimensions = [
+            (AgentType.RISK, ["稳不稳", "能不能报", "能报吗", "录取概率", "录取风险", "位次", "分数线", "录取线", "最低分", "冲稳保"]),
+            (AgentType.POLICY, ["转专业", "调剂", "退档", "体检", "招生章程", "录取规则", "招生计划", "学费", "住宿费", "收费"]),
+            (AgentType.PLANNING, ["怎么选", "对比", "区别", "搭配", "组合", "专业推荐", "就业", "升学", "考研", "保研", "课程", "学什么"]),
+            (AgentType.GENERAL, ["宿舍", "食堂", "校区", "社团", "校园生活", "学校优势", "在哪个城市"]),
+        ]
+        matched = [
+            agent_type
+            for agent_type, keywords in dimensions
+            if any(keyword in msg for keyword in keywords)
+        ]
+
+        # 至少命中两个维度，才认为用户在问复合问题；否则交给主路由即可。
+        if len(set(matched)) >= 2:
+            targets.extend(matched)
 
         # 保持顺序去重，并只返回当前有实例的 Agent 类型。
         deduped = list(dict.fromkeys(targets))
@@ -342,7 +410,7 @@ class AgentOrchestrator:
         return max(agents, key=lambda a: a.stats.routing_score())
 
     async def _execute(self, req: Request, agent_type: AgentType) -> AgentResponse:
-        """执行 Agent，失败时降级到 GeneralAgent。"""
+        """执行 Agent，失败时降级到 GeneralAdmissionsAgent。"""
         agent = self._best_agent(agent_type)
         if agent is None:
             agent = self._best_agent(AgentType.GENERAL)
@@ -353,16 +421,35 @@ class AgentOrchestrator:
                 success=False,
             )
 
-        response = await agent.handle(req)
+        scoped_req = self._with_skills(req, agent.agent_type)
+        response = await agent.handle(scoped_req)
 
-        # 专属 Agent 失败时降级到 GeneralAgent
+        # 专属 Agent 失败时降级到 GeneralAdmissionsAgent
         if not response.success and agent_type != AgentType.GENERAL:
-            logger.warning(f"{agent_type.value} 失败，降级到 GeneralAgent")
+            logger.warning(f"{agent_type.value} 失败，降级到 GeneralAdmissionsAgent")
             fallback = self._best_agent(AgentType.GENERAL)
             if fallback:
-                response = await fallback.handle(req)
+                fallback_req = self._with_skills(req, fallback.agent_type)
+                response = await fallback.handle(fallback_req)
 
         return response
+
+    def _with_skills(self, req: Request, agent_type: AgentType) -> Request:
+        """
+        按当前 Agent 类型和用户关键词筛选 Skills，并创建请求副本。
+
+        并行协作时每个 Agent 会拿到自己的 Skill 上下文，避免共享 Request 被并发修改。
+        """
+        if self._skill_manager is None:
+            return req
+        try:
+            skills_context = self._skill_manager.prompt_for(req.message, agent_type.value)
+        except Exception as ex:
+            logger.warning(f"SkillManager 构建上下文失败: {ex}")
+            return req
+        if not skills_context:
+            return req
+        return replace(req, skills_context=skills_context)
 
     # ── 统计（供 Monitor 读取）────────────────────────────────────────────────
 
@@ -384,10 +471,16 @@ class AgentOrchestrator:
         """
         接收 Monitor 的在线表现反馈，动态调整路由惩罚项。
 
-        penalties 的 key 使用 get_stats() 中的 agent key，例如 technical_0。
+        penalties 的 key 使用 get_stats() 中的 agent key，例如 risk_0。
         """
         for agent_type, agents in self._pool.items():
             for i, agent in enumerate(agents):
                 key = f"{agent_type.value}_{i}"
                 penalty = penalties.get(key, 0.0)
                 agent.stats.monitor_penalty = min(max(penalty, 0.0), 0.9)
+
+    @staticmethod
+    def _intent_value(intent: Optional[IntentCategory]) -> str:
+        if intent is None:
+            return ""
+        return str(getattr(intent, "value", intent))

@@ -1,7 +1,7 @@
-param(
+﻿param(
     [ValidateSet("build", "build-prod", "build-dev")]
     [string]$Command = "build-prod",
-    [string]$ImageName = "echomind",
+    [string]$ImageName = "hebutguide",
     [string]$Version = "latest",
     [switch]$NoCache,
     [string]$Platform = "",
@@ -51,3 +51,5 @@ Write-Host "[INFO] Command: docker $($args -join ' ')"
 & docker @args
 
 Write-Host "[INFO] Build complete: $imageWithVersion"
+
+

@@ -2,17 +2,17 @@
   <main class="app-shell">
     <aside class="sidebar">
       <section class="brand">
-        <div class="brand-mark">EM</div>
+        <div class="brand-mark">HG</div>
         <div>
-          <h1>EchoMind Console</h1>
-          <p>统一调试 Python 与 Java 版本</p>
+          <h1>HebutGuide Console</h1>
+          <p>河北工业大学报考咨询 Agent 调试台</p>
         </div>
       </section>
 
-      <a class="profile-card" href="https://xhslink.com/m/558VOQs4Otc" target="_blank" rel="noreferrer">
-        <span>我的主页</span>
-        <strong>小红书 69.6K 次赞与收藏</strong>
-        <em>来看看我的主页 &gt;&gt;</em>
+      <a class="profile-card" href="https://zs.hebut.edu.cn/" target="_blank" rel="noreferrer">
+        <span>官方招生信息</span>
+        <strong>咨询 QQ 群：925926323</strong>
+        <em>河北工业大学本科招生网 &gt;&gt;</em>
       </a>
 
       <section class="panel">
@@ -74,12 +74,12 @@
     <section class="workspace">
       <header class="workspace-header">
         <div>
-          <span class="eyebrow">EchoMind Workspace</span>
-          <h2>对话调试</h2>
+          <span class="eyebrow">HebutGuide Workspace</span>
+          <h2>报考咨询调试</h2>
           <p>{{ currentBackend.baseUrl }}</p>
         </div>
         <div class="header-actions">
-          <a class="profile-link" href="https://xhslink.com/m/558VOQs4Otc" target="_blank" rel="noreferrer">小红书主页</a>
+          <a class="profile-link" href="https://zs.hebut.edu.cn/" target="_blank" rel="noreferrer">本科招生网</a>
           <a :href="docsUrl" target="_blank" rel="noreferrer">API 文档</a>
         </div>
       </header>
@@ -94,13 +94,13 @@
             <p>{{ item.content }}</p>
           </article>
           <div v-if="messages.length === 0" class="empty-state">
-            <h3>开始一次客服对话</h3>
-            <p>可切换 Java 或 Python 后端，前端会自动适配响应字段。</p>
+            <h3>开始咨询</h3>
+            <p>可咨询学校概况、专业信息、录取政策、分数位次、宿舍学费和就业前景。</p>
           </div>
         </div>
 
         <form class="composer" @submit.prevent="sendMessage">
-          <textarea v-model="draft" rows="3" placeholder="输入问题，例如：我想申请退款，订单号是 #12345"></textarea>
+          <textarea v-model="draft" rows="3" placeholder="输入问题，例如：我是河北物理类620分，位次9000，报计算机稳吗？"></textarea>
           <button :disabled="busy || !draft.trim()">{{ busy ? '发送中' : '发送' }}</button>
         </form>
       </section>
@@ -112,7 +112,7 @@
             <span class="pill soft">RAG</span>
           </div>
           <div class="inline-form">
-            <input v-model="searchQuery" placeholder="退款多久能到账" />
+            <input v-model="searchQuery" placeholder="河北工业大学转专业政策" />
             <button @click="searchKnowledge" :disabled="busy || !searchQuery.trim()">检索</button>
           </div>
           <div class="result-list">
@@ -131,11 +131,11 @@
           </div>
           <label>
             <span>标题</span>
-            <input v-model="docTitle" placeholder="退款补充政策" />
+            <input v-model="docTitle" placeholder="2026年本科招生章程补充说明" />
           </label>
           <label>
             <span>内容</span>
-            <textarea v-model="docContent" rows="5" placeholder="输入知识库内容"></textarea>
+            <textarea v-model="docContent" rows="5" placeholder="输入招生政策、专业介绍、校园生活等知识库内容"></textarea>
           </label>
           <div class="actions">
             <button @click="submitKnowledge" :disabled="busy || !docTitle.trim() || !docContent.trim()">添加文档</button>
@@ -173,10 +173,10 @@ const healthOk = ref(false)
 const healthLabel = ref('未检查')
 const statusText = ref('')
 const knowledgeCount = ref('-')
-const searchQuery = ref('退款多久能到账')
+const searchQuery = ref('河北工业大学转专业政策')
 const searchResults = ref([])
-const docTitle = ref('退款补充政策')
-const docContent = ref('大促期间退款审核时间可能延长到 3-5 个工作日。')
+const docTitle = ref('河北工业大学招生补充说明')
+const docContent = ref('考生咨询录取风险时，应结合省份、科类、分数、位次和目标专业综合判断，最终以学校招生网和省考试院公布信息为准。')
 const messageList = ref(null)
 
 const currentBackend = computed(() => backendMeta(settings.backend, settings))
@@ -224,8 +224,8 @@ async function sendMessage() {
     const meta = [
       response.intent,
       response.agentType,
-      response.knowledgeUsed ? 'RAG' : '',
-      response.escalated ? '转人工' : ''
+      response.knowledgeUsed ? '知识增强' : '',
+      response.escalated ? '建议官方确认:https://zs.hebut.edu.cn/' : ''
     ].filter(Boolean).join(' · ')
     messages.value.push({
       id: crypto.randomUUID(),

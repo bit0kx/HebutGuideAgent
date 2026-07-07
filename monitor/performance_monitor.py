@@ -10,7 +10,10 @@
      Orchestrator 的 _best_agent() 会据此动态调整路由权重
   4. 优化建议 —— 基于规则生成可操作的优化建议（不是空话）
   5. 告警 —— 超阈值时打日志 + 可选 Webhook
+
 """
+# 目前每类agent只有单实例，简单、稳定、可控；Monitor 自动降权机制保留即可，作为监控解释和未来多实例扩展的基础
+  
 import asyncio
 import logging
 import statistics
@@ -254,21 +257,43 @@ class PerformanceMonitor:
         if metric not in self.THRESHOLDS:
             return
         threshold, severity, operator = self.THRESHOLDS[metric]
+        metric_key = f"{metric}:{label}"
         triggered = (operator == "less_than" and value < threshold) or \
                     (operator == "greater_than" and value > threshold)
+        active_alerts = [a for a in self._alerts if a.metric == metric_key and not a.resolved]
         if triggered:
-            alert = Alert(
+            message = f"{label} 的 {metric} = {value:.3f}，阈值 {threshold}"
+            if active_alerts:
+                current_alert = active_alerts[-1]
+                for old_alert in active_alerts[:-1]:
+                    old_alert.resolved = True
+                current_alert.severity = severity
+                current_alert.message = message
+                current_alert.value = value
+                current_alert.threshold = threshold
+                current_alert.ts = datetime.now().isoformat()
+                return
+
+            new_alert = Alert(
                 severity=severity,
-                metric=f"{metric}:{label}",
-                message=f"{label} 的 {metric} = {value:.3f}，阈值 {threshold}",
+                metric=metric_key,
+                message=message,
                 value=value,
                 threshold=threshold,
             )
-            self._alerts.append(alert)
-            logger.warning(f"[{severity.value.upper()}] {alert.message}")
+            self._alerts.append(new_alert)
+            logger.warning(f"[{severity.value.upper()}] {new_alert.message}")
             # 异步发送 Webhook（不阻塞采集循环）
             if self._webhook:
-                asyncio.create_task(self._send_webhook(alert))
+                asyncio.create_task(self._send_webhook(new_alert))
+            return
+
+        for active_alert in active_alerts:
+            active_alert.resolved = True
+            active_alert.value = value
+            active_alert.ts = datetime.now().isoformat()
+        if active_alerts:
+            logger.info(f"[RESOLVED] {metric_key} 恢复正常，当前值 {value:.3f}")
 
     def _generate_routing_suggestions(self, agent_stats: Dict[str, Any]) -> None:
         """

@@ -47,7 +47,7 @@ class MemoryContext:
     """传给 Agent 的完整上下文。"""
     recent_messages:  List[Message]   # 工作记忆：最近对话
     relevant_history: List[str]       # 情景记忆：语义相关的历史片段
-    user_profile:     Dict[str, Any]  # 用户画像：偏好、常用实体
+    user_profile:     Dict[str, Any]  # 考生画像：省份、科类、分数、位次、专业偏好
     summary:          str             # 当前会话摘要（压缩后）
 
     @staticmethod
@@ -63,7 +63,7 @@ class MemoryContext:
         if self.relevant_history:
             parts.append("[相关历史]\n" + "\n".join(f"- {self._clean(h)}" for h in self.relevant_history[:3]))
         if self.user_profile:
-            parts.append(f"[用户画像]\n{json.dumps(self.user_profile, ensure_ascii=True)}")
+            parts.append(f"[考生画像]\n{json.dumps(self.user_profile, ensure_ascii=False)}")
         if self.recent_messages:
             parts.append("[最近对话]")
             for m in self.recent_messages:
@@ -149,8 +149,8 @@ class MemoryManager:
 
     async def update_profile(self, user_id: str, conv_id: str) -> None:
         """
-        从当前工作记忆中提炼用户偏好，更新用户画像。
-        用 LLM 提炼偏好，然后存入 ChromaDB（ChromaDB 内置 embedding，不依赖外部 API）。
+        从当前工作记忆中提炼考生报考画像，更新用户画像。
+        用 LLM 提炼省份、科类、分数、位次、专业偏好等，然后存入 ChromaDB。
         """
         user_id = self._safe_text(user_id)
         conv_id = self._safe_text(conv_id)
@@ -159,11 +159,42 @@ class MemoryManager:
             return
 
         text = self._safe_text("\n".join(f"{m.role.value}: {m.content}" for m in messages[-10:]))
-        prompt = f"""从以下对话中提炼用户偏好和关键实体，返回 JSON。
+        prompt = f"""从以下大学招生咨询对话中提炼考生报考画像，返回 JSON。
+
+重点提取：
+- province: 考生省份，例如河北、天津、河南
+- subject_type: 科类或选科，例如物理类、历史类、理科、文科、综合改革
+- score: 高考分数，只保留数字字符串
+- rank: 高考位次，只保留数字字符串
+- target_school: 目标学校，当前项目默认是河北工业大学
+- target_majors: 目标专业列表，例如计算机科学与技术、软件工程
+- preferences: 报考偏好，例如就业好、城市交通方便、考研、保研、宿舍好、低学费
+- risk_preference: 风险偏好，只能是 稳妥 / 冲刺 / 均衡 / 保底 / 未知
+- concerns: 关注点，例如转专业、宿舍、奖学金、就业、考研率、校区、学费
+- budget_sensitive: 是否明显关注费用，true/false
+- accepts_adjustment: 是否接受专业调剂，true/false/null
+- accepts_sino_foreign: 是否接受中外合作或高学费项目，true/false/null
+
+没有提到的信息使用空字符串、空列表、false 或 null，不要编造。
+
 对话:
 {text}
 
-返回格式: {{"preferences": ["..."], "entities": {{"产品": [], "问题类型": []}}}}"""
+返回格式:
+{{
+  "province": "",
+  "subject_type": "",
+  "score": "",
+  "rank": "",
+  "target_school": "河北工业大学",
+  "target_majors": [],
+  "preferences": [],
+  "risk_preference": "未知",
+  "concerns": [],
+  "budget_sensitive": false,
+  "accepts_adjustment": null,
+  "accepts_sino_foreign": null
+}}"""
         prompt = self._safe_text(prompt)
 
         try:
@@ -173,9 +204,11 @@ class MemoryManager:
             )
             raw = resp.content[0].text
             s, e = raw.find("{"), raw.rfind("}") + 1
-            profile_data = json.loads(raw[s:e])
+            extracted_profile = json.loads(raw[s:e])
+            old_profile = await self._get_profile(user_id)
+            profile_data = self._merge_profile(old_profile, extracted_profile)
 
-            doc_id = f"{user_id}_profile_{conv_id}"
+            doc_id = f"{user_id}_profile"
             doc_text = self._safe_text(json.dumps(profile_data, ensure_ascii=False))
 
             try:
@@ -327,14 +360,128 @@ class MemoryManager:
             logger.warning(f"存储情景记忆失败: {ex}")
 
     async def _get_profile(self, user_id: str) -> Dict[str, Any]:
-        """获取用户画像（取最新一条）。"""
+        """获取考生画像（取最新一条）。"""
         try:
-            results = self._profile.get(where={"user_id": user_id}, limit=1)
-            if results["documents"]:
-                return json.loads(results["documents"][0])
-        except Exception:
-            pass
+            results = self._profile.get(where={"user_id": user_id})
+            docs = results.get("documents", [])
+            metas = results.get("metadatas", [])
+            if not docs:
+                return {}
+            latest_idx = 0
+            latest_ts = ""
+            for idx, meta in enumerate(metas or []):
+                ts = str((meta or {}).get("ts", ""))
+                if ts >= latest_ts:
+                    latest_ts = ts
+                    latest_idx = idx
+            return json.loads(docs[latest_idx])
+        except Exception as ex:
+            logger.warning(f"获取考生画像失败: {ex}")
         return {}
+
+    @classmethod
+    def _merge_profile(cls, old: Dict[str, Any], new: Dict[str, Any]) -> Dict[str, Any]:
+        """合并考生画像：保留旧信息，只用明确的新信息覆盖或追加。"""
+        merged = cls._default_profile()
+        if isinstance(old, dict):
+            merged.update(cls._normalize_profile(old))
+        new_profile = cls._normalize_profile(new if isinstance(new, dict) else {})
+
+        scalar_keys = ["province", "subject_type", "score", "rank", "target_school", "risk_preference"]
+        for key in scalar_keys:
+            value = new_profile.get(key)
+            if value not in (None, "", [], {}):
+                merged[key] = value
+
+        list_keys = ["target_majors", "preferences", "concerns"]
+        for key in list_keys:
+            merged[key] = cls._merge_unique_list(merged.get(key), new_profile.get(key))
+
+        if new_profile.get("budget_sensitive") is True:
+            merged["budget_sensitive"] = True
+        for key in ["accepts_adjustment", "accepts_sino_foreign"]:
+            if new_profile.get(key) is not None:
+                merged[key] = new_profile[key]
+
+        merged["updated_at"] = datetime.now().isoformat()
+        return merged
+
+    @staticmethod
+    def _default_profile() -> Dict[str, Any]:
+        return {
+            "province": "",
+            "subject_type": "",
+            "score": "",
+            "rank": "",
+            "target_school": "河北工业大学",
+            "target_majors": [],
+            "preferences": [],
+            "risk_preference": "未知",
+            "concerns": [],
+            "budget_sensitive": False,
+            "accepts_adjustment": None,
+            "accepts_sino_foreign": None,
+            "updated_at": "",
+        }
+
+    @classmethod
+    def _normalize_profile(cls, profile: Dict[str, Any]) -> Dict[str, Any]:
+        normalized = cls._default_profile()
+        for key in normalized:
+            if key in profile:
+                normalized[key] = profile[key]
+
+        for key in ["province", "subject_type", "score", "rank", "target_school", "risk_preference"]:
+            normalized[key] = cls._safe_text(normalized.get(key)).strip()
+
+        if not normalized["target_school"]:
+            normalized["target_school"] = "河北工业大学"
+        if normalized["risk_preference"] not in {"稳妥", "冲刺", "均衡", "保底", "未知"}:
+            normalized["risk_preference"] = "未知"
+
+        for key in ["target_majors", "preferences", "concerns"]:
+            normalized[key] = cls._as_clean_list(normalized.get(key))
+
+        for key in ["budget_sensitive", "accepts_adjustment", "accepts_sino_foreign"]:
+            normalized[key] = cls._normalize_bool_or_none(normalized.get(key))
+
+        return normalized
+
+    @classmethod
+    def _as_clean_list(cls, value: Any) -> List[str]:
+        if value is None:
+            return []
+        if isinstance(value, str):
+            items = [value]
+        elif isinstance(value, list):
+            items = value
+        else:
+            items = [value]
+        return list(dict.fromkeys(
+            cls._safe_text(item).strip()
+            for item in items
+            if cls._safe_text(item).strip()
+        ))
+
+    @classmethod
+    def _merge_unique_list(cls, old: Any, new: Any) -> List[str]:
+        return list(dict.fromkeys(cls._as_clean_list(old) + cls._as_clean_list(new)))
+
+    @staticmethod
+    def _normalize_bool_or_none(value: Any) -> Optional[bool]:
+        if value is None:
+            return None
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str):
+            text = value.strip().lower()
+            if text in {"true", "yes", "1", "是", "接受", "愿意"}:
+                return True
+            if text in {"false", "no", "0", "否", "不接受", "不愿意"}:
+                return False
+            if text in {"", "null", "none", "未知"}:
+                return None
+        return bool(value)
 
     @staticmethod
     def _wm_key(user_id: str, conv_id: str) -> str:

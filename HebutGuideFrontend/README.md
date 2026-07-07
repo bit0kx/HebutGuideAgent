@@ -1,13 +1,13 @@
-﻿# EchoMind 前端部署说明
+﻿# HebutGuide 前端部署说明
 
-这是 EchoMind 的 Vue + Vite 前端项目，可连接 Python 后端和 Java 后端。当前全栈 Docker 部署默认连接 Python 后端。
+这是 HebutGuide 的 Vue + Vite 前端项目，可连接 Python 后端和 Java 后端。当前全栈 Docker 部署默认连接 Python 后端。
 
 ## 本地开发
 
 进入前端目录：
 
 ```powershell
-cd EchoMindFrontend
+cd HebutGuideFrontend
 ```
 
 安装依赖：
@@ -40,7 +40,7 @@ http://localhost:5173
 如果后端已经在宿主机运行，可以只启动前端容器：
 
 ```powershell
-cd EchoMindFrontend
+cd HebutGuideFrontend
 docker compose up -d --build
 ```
 
@@ -57,7 +57,7 @@ http://localhost:5174
 推荐在项目根目录使用根 compose 一次启动后端、依赖服务和前端：
 
 ```powershell
-cd D:\桌面\EchoMind
+cd D:\桌面\HebutGuide
 docker compose up -d --build
 ```
 
@@ -117,3 +117,4 @@ docker compose up -d --build frontend
 ```powershell
 docker compose down
 ```
+

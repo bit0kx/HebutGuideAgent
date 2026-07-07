@@ -1,7 +1,7 @@
-param(
-    [string]$ImageName = "echomind",
+﻿param(
+    [string]$ImageName = "hebutguide",
     [string]$Version = "latest",
-    [string]$ContainerName = "echomind-app",
+    [string]$ContainerName = "hebutguide-app",
     [string]$EnvFile = ".env",
     [int]$ApiPort = 8000,
     [switch]$Detach,
@@ -50,3 +50,5 @@ Write-Host "[INFO] Command: docker $($args -join ' ')"
 & docker @args
 
 Write-Host "[INFO] API: http://localhost:$ApiPort"
+
+

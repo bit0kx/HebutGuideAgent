@@ -1,4 +1,4 @@
-# EchoMind 智能客服系统 — Docker 多阶段构建
+﻿# HebutGuide 招生咨询系统 — Docker 多阶段构建
 # 目标：生产镜像尽量精简，开发镜像包含调试工具
 
 # ── 阶段 1：基础环境 ──────────────────────────────────────────────────────────
@@ -49,7 +49,7 @@ FROM base AS production
 COPY --from=dependencies /usr/local/lib/python3.12/site-packages /usr/local/lib/python3.12/site-packages
 COPY --from=dependencies /usr/local/bin /usr/local/bin
 # 复制预下载的 ONNX 模型缓存
-COPY --from=dependencies /root/.cache/chroma /home/echomind/.cache/chroma
+COPY --from=dependencies /root/.cache/chroma /home/hebutguide/.cache/chroma
 
 # 复制应用代码
 COPY . .
@@ -58,10 +58,10 @@ COPY . .
 RUN mkdir -p /app/data/chroma /app/logs /app/config
 
 # 非 root 用户运行
-RUN useradd -m -u 1000 echomind && \
-    chown -R echomind:echomind /app && \
-    chown -R echomind:echomind /home/echomind/.cache
-USER echomind
+RUN useradd -m -u 1000 hebutguide && \
+    chown -R hebutguide:hebutguide /app && \
+    chown -R hebutguide:hebutguide /home/hebutguide/.cache
+USER hebutguide
 
 EXPOSE 8000
 
@@ -81,3 +81,5 @@ RUN mkdir -p /app/data/chroma /app/logs /app/config /app/tests && \
 EXPOSE 8000
 
 CMD ["python", "-m", "uvicorn", "api.main:app", "--host", "0.0.0.0", "--port", "8000", "--reload"]
+
+
