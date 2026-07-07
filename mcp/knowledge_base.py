@@ -13,6 +13,7 @@ ChromaDB 在这里的角色：
 """
 import hashlib
 import logging
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import chromadb
@@ -297,7 +298,7 @@ class KnowledgeBase:
 
     def _load_default_docs(self) -> None:
         """导入默认知识库文档（大学报考咨询场景常见问题）。"""
-        """导入河北工业大学招生咨询默认知识库文档"""
+        """导入data/demo_docs中知识库文档"""
         default_docs = [
             {
                 "title": "学校概况：办学层次、校区、学科与校园资源",
@@ -527,7 +528,36 @@ class KnowledgeBase:
                 ),
             },
         ]
-        self.add_documents(default_docs)
-        logger.info(f"已导入默认知识库: {len(default_docs)} 篇文档")
+        demo_docs = self._load_demo_text_docs()
+        docs = default_docs + demo_docs
+
+        self.add_documents(docs)
+        logger.info(
+            f"已导入默认知识库: {len(docs)} 篇文档"
+            f"（内置 {len(default_docs)} 篇，demo_docs {len(demo_docs)} 篇）"
+        )
+
+    def _load_demo_text_docs(self) -> List[Dict[str, str]]:
+        """从 data/demo_docs 自动导入 .txt 知识文档，文件名作为标题。"""
+        docs_dir = Path(__file__).resolve().parents[1] / "data" / "demo_docs"
+        if not docs_dir.exists():
+            return []
+
+        docs: List[Dict[str, str]] = []
+        for path in sorted(docs_dir.glob("*.txt")):
+            try:
+                content = path.read_text(encoding="utf-8-sig").strip()
+            except UnicodeDecodeError:
+                content = path.read_text(encoding="gb18030").strip()
+            except Exception as ex:
+                logger.warning(f"读取 demo 知识文档失败: {path.name}: {ex}")
+                continue
+
+            if not content:
+                continue
+
+            docs.append({"title": path.stem, "content": content})
+
+        return docs
 
 
