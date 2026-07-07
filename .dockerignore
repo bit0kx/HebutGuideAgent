@@ -16,6 +16,8 @@ __pycache__
 
 data/*
 !data/
+!data/demo_docs/
+!data/demo_docs/**
 !data/hebut_hebei.xlsx
 !data/hebut_tianjin.xlsx
 logs

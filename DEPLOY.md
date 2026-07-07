@@ -122,7 +122,7 @@ docker compose up -d --build
 说明：
 
 - `docker compose down -v` 会删除本项目 compose 中声明的数据卷，包括 `redis-data` 和 `chromadb-data`，同时也会删除 Prometheus、Nginx 日志卷。
-- 重启后 ChromaDB 为空，后端启动时会重新导入代码中的默认知识库。
+- 重启后 ChromaDB 为空，后端启动时会重新导入代码中的默认知识库，并自动导入 `data/demo_docs/*.txt`。
 - 如果曾经在 ChromaDB 服务不可用时使用过本地嵌入式 Chroma，还可以额外清理项目目录中的备用数据：
 
 ```powershell

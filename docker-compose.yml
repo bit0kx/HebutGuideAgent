@@ -94,6 +94,7 @@ services:
       - HEBUTGUIDE_SKILLS_MAX_CHARS=${HEBUTGUIDE_SKILLS_MAX_CHARS:-5000}
     volumes:
       - ./skills:/app/skills:ro
+      - ./data/demo_docs:/app/data/demo_docs:ro
       - ./data/hebut_hebei.xlsx:/app/data/hebut_hebei.xlsx:ro
       - ./data/hebut_tianjin.xlsx:/app/data/hebut_tianjin.xlsx:ro
       - ./data/chroma:/app/data/chroma
