@@ -8,6 +8,7 @@ import asyncio
 import logging
 import os
 import pathlib
+import re
 import sys
 import uuid
 from contextlib import asynccontextmanager
@@ -323,6 +324,7 @@ async def chat(req: ChatRequest):
 
     # 4. 选择对应类型agent执行
     result = await _orchestrator.run(orch_req)
+    result.response = _sanitize_admission_response(result.response, orch_req.context)
 
     # 5. 写入记忆
     await _memory.add_message(req.user_id, conv_id, MsgRole.USER, req.message)
@@ -483,34 +485,172 @@ async def _build_risk_context(
             parts.append(str(data.get("message", "请补充省份、科类、分数、位次和目标专业。")))
             parts.append("MCP 状态不是 ok 时，只能追问缺失信息，不得生成历年分数、位次或风险结论。")
         elif status == "ok":
-            score = data.get("user_score")
-            score_text = f"{score} 分，" if score not in (None, "") else ""
-            parts.append(
-                "考生条件: "
-                f"{data.get('province')} {data.get('subject_type')} "
-                f"{score_text}位次 {data.get('user_rank')}，"
-                f"目标专业 {data.get('major')}"
-            )
-            parts.append(f"依据: {data.get('reason', '')}")
-            parts.append(f"建议: {data.get('suggestion', '')}")
-            history = data.get("history", [])
-            if isinstance(history, list) and history:
-                parts.append("历年数据:")
-                for item in history:
-                    parts.append(
-                        f"- {item.get('year')}: 最低分 {item.get('min_score')}，"
-                        f"最低位次 {item.get('min_rank')}，计划数 {item.get('plan')}"
-                    )
-            parts.append(str(data.get("disclaimer", "")))
+            parts.extend(_render_risk_context(data))
         else:
             parts.append(str(data.get("message", "未获得可用风险评估结果。")))
             parts.append("MCP 状态不是 ok 时，只能说明无法自动判断，不得生成历年分数、位次或风险结论。")
 
-        parts.append("请基于以上 MCP 结果回答；不得承诺一定录取，应说明该判断仅供参考。")
+        parts.append("请基于以上 MCP 结构化结果回答；原始事实只能引用 facts，派生判断只能引用 derived_claims，不得重算、补充或改写为新的分数位次。")
         return "\n".join(part for part in parts if part), True
     except Exception as ex:
         logger.warning(f"构建录取风险上下文失败: {ex}")
         return "", False
+
+
+def _render_risk_context(data: Dict[str, Any]) -> List[str]:
+    """把 MCP 结构化事实和派生判断渲染成受控上下文，避免 LLM 自行计算数据。"""
+    parts: List[str] = []
+    score = data.get("user_score")
+    score_text = f"{score} 分，" if score not in (None, "") else ""
+    parts.append(
+        "考生条件: "
+        f"{data.get('province')} {data.get('subject_type')} "
+        f"{score_text}位次 {data.get('user_rank')}，"
+        f"目标专业 {data.get('major')}"
+    )
+
+    facts = data.get("facts") or data.get("history") or []
+    if isinstance(facts, list) and facts:
+        parts.append("[facts 原始事实：以下年份、最低分、最低位次和来源必须逐项照引，不得新增]")
+        for fact in facts:
+            if isinstance(fact, dict):
+                parts.append(_fact_line(fact))
+
+    derived = data.get("derived_claims") if isinstance(data.get("derived_claims"), dict) else {}
+    if derived:
+        parts.append("[derived_claims MCP 派生判断：只能引用，不得让模型重新计算]")
+        parts.append(
+            "记录年数: "
+            f"{derived.get('records_count')}；最低分均值约 {derived.get('avg_min_score')}；"
+            f"最低位次均值约 {derived.get('avg_min_rank')}；"
+            f"匹配年份数 {derived.get('matched_years')}；"
+            f"最小位次余量 {derived.get('best_rank_margin')}；"
+            f"风险判断 {derived.get('risk_level')}"
+        )
+        suggestion = str(derived.get("suggestion", "")).strip()
+        if suggestion:
+            parts.append(f"工具建议: {suggestion}")
+    else:
+        parts.append(f"依据: {data.get('reason', '')}")
+        parts.append(f"建议: {data.get('suggestion', '')}")
+
+    alternatives = data.get("alternative_majors", [])
+    if isinstance(alternatives, list):
+        note = str(data.get("alternative_note", "")).strip()
+        if note:
+            parts.append(note)
+        if alternatives:
+            parts.append("[alternative_majors MCP 候选：只能从以下候选中推荐稳妥搭配专业]")
+            for alt in alternatives:
+                if not isinstance(alt, dict):
+                    continue
+                special_text = "，特殊培养类型，需确认学费/培养模式/是否接受" if alt.get("special_type") else ""
+                alt_derived = alt.get("derived_claims") if isinstance(alt.get("derived_claims"), dict) else {}
+                parts.append(
+                    f"- {alt.get('major')}: {alt_derived.get('risk_level', alt.get('risk_level'))}，"
+                    f"记录年数 {alt_derived.get('records_count', alt.get('years_count'))}，"
+                    f"最低分均值约 {alt_derived.get('avg_min_score', alt.get('avg_min_score'))}，"
+                    f"最低位次均值约 {alt_derived.get('avg_min_rank', alt.get('avg_min_rank'))}，"
+                    f"最小位次余量 {alt_derived.get('min_rank_margin', alt.get('min_rank_margin'))}"
+                    f"{special_text}"
+                )
+                alt_facts = alt.get("facts") or alt.get("history") or []
+                if isinstance(alt_facts, list):
+                    for fact in alt_facts:
+                        if isinstance(fact, dict):
+                            parts.append("  " + _fact_line(fact))
+        else:
+            parts.append("MCP 未返回稳妥搭配专业候选时，不得自行列举专业或生成历年分数位次。")
+
+    disclaimer = str(data.get("disclaimer", "")).strip()
+    if disclaimer:
+        parts.append(disclaimer)
+    return parts
+
+
+def _fact_line(fact: Dict[str, Any]) -> str:
+    return (
+        f"- {fact.get('year')}: {fact.get('province')} {fact.get('subject_type')} "
+        f"{fact.get('major')}，最低分 {fact.get('min_score')}，"
+        f"最低位次 {fact.get('min_rank')}，计划数 {fact.get('plan')}，"
+        f"source={fact.get('source')}"
+    )
+
+
+def _sanitize_admission_response(response: str, context: str) -> str:
+    """运行时兜底：移除未被本轮 MCP 上下文支持的录取数据和风险结论。"""
+    if not context or "[MCP 录取风险评估结果]" not in context:
+        return response
+
+    sanitized = _redact_unverified_admission_records(response, context)
+    sanitized = _redact_unverified_fuzzy_admission_numbers(sanitized, context)
+
+    status = _mcp_status(context)
+    if status and status != "ok" and _has_unsupported_risk_conclusion(sanitized):
+        return _risk_unavailable_response(context)
+    return sanitized
+
+
+def _redact_unverified_admission_records(response: str, context: str) -> str:
+    allowed = _extract_admission_records(context)
+    redacted_lines: List[str] = []
+    for line in response.splitlines():
+        records = _extract_admission_records(line)
+        if records and (not allowed or not records.issubset(allowed)):
+            redacted_lines.append("该年份录取数据未在当前工具结果中核验，已省略。")
+        else:
+            redacted_lines.append(line)
+    return "\n".join(redacted_lines)
+
+
+def _redact_unverified_fuzzy_admission_numbers(response: str, context: str) -> str:
+    context_numbers = set(re.findall(r"\d{3,7}", context or ""))
+    redacted_lines: List[str] = []
+    fuzzy_pattern = re.compile(r"(大概|大约|约|左右|上下).{0,12}(\d{3,7})|(\d{3,7}).{0,12}(大概|大约|约|左右|上下)")
+    for line in response.splitlines():
+        if not any(marker in line for marker in ["分", "位次", "排名", "名"]):
+            redacted_lines.append(line)
+            continue
+        numbers = [match.group(2) or match.group(3) for match in fuzzy_pattern.finditer(line)]
+        if numbers and any(number not in context_numbers for number in numbers):
+            redacted_lines.append("当前工具结果未提供可核验的分数范围或位次范围，不能直接给出具体数值估计。")
+        else:
+            redacted_lines.append(line)
+    return "\n".join(redacted_lines)
+
+
+def _extract_admission_records(text: str) -> set[tuple[int, int, int]]:
+    records: set[tuple[int, int, int]] = set()
+    pattern = re.compile(
+        r"(20\d{2})\s*年?[^\n。；;]*?"
+        r"最低分\s*[：:]?\s*(\d{3})[^\n。；;]*?"
+        r"最低位次\s*[：:]?\s*(\d{3,7})"
+    )
+    for match in pattern.finditer(text or ""):
+        records.add((int(match.group(1)), int(match.group(2)), int(match.group(3))))
+    return records
+
+
+def _mcp_status(context: str) -> str:
+    match = re.search(r"状态:\s*([a-zA-Z_]+)", context or "")
+    return match.group(1) if match else ""
+
+
+def _has_unsupported_risk_conclusion(response: str) -> bool:
+    return bool(re.search(r"(属于|判断为|评估为|综合判断[:：]?\s*|结论[:：]?\s*)(稳中有波动|稳|冲|保|风险较高)", response or ""))
+
+
+def _risk_unavailable_response(context: str) -> str:
+    status = _mcp_status(context)
+    if status == "need_more_info":
+        missing_match = re.search(r"缺少信息:\s*([^\n]+)", context or "")
+        missing = missing_match.group(1) if missing_match else "省份、科类/选科、位次和目标专业"
+        return f"当前信息不足，无法给出可靠的冲稳保判断。请先补充：{missing}。"
+    if status == "unsupported_province":
+        return "当前结构化录取数据暂不支持该省份，无法给出可靠的冲稳保判断。请以河北工业大学本科招生网和所在省考试院数据为准。"
+    if status == "no_data":
+        return "当前结构化录取数据中没有匹配的省份、科类或专业记录，无法给出可靠的冲稳保判断。请核对专业名称，并以本科招生网数据为准。"
+    return "当前 MCP 工具未返回可核验的录取风险结果，无法给出可靠的冲稳保判断。"
 
 
 def _build_risk_query(message: str, history: Optional[List[Dict[str, str]]] = None) -> str:
@@ -651,6 +791,7 @@ def _should_use_risk_assessment(message: str, intent=None) -> bool:
     risk_keywords = [
         "分", "位次", "排名", "能报", "稳吗", "稳不稳", "冲", "稳", "保",
         "录取线", "分数线", "最低分", "最低位次", "报考风险",
+        "搭配", "备选", "保底", "组合", "推荐专业",
     ]
     return any(kw in msg for kw in risk_keywords)
 
@@ -965,6 +1106,7 @@ async def _cli():
             tool_manager=tool_manager,
         )
         result = await orch.run(req)
+        result.response = _sanitize_admission_response(result.response, req.context)
 
         await mem.add_message(user_id, conv_id, MsgRole.USER, msg)
         await mem.add_message(user_id, conv_id, MsgRole.ASSISTANT, result.response)

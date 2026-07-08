@@ -28,6 +28,7 @@ class AdmissionRecord:
     min_score: int
     min_rank: int
     plan: Optional[int] = None
+    source: str = ""
 
 
 # # 演示用 mock 数据。生产环境建议替换为数据库、Excel、官网接口或数据中台查询。
@@ -126,6 +127,7 @@ def _load_records_from_xlsx(
                     min_score=score,
                     min_rank=rank,
                     plan=None,
+                    source=path.name,
                 )
             )
     return records
@@ -250,6 +252,7 @@ def _normalize_params(params: Dict[str, Any]) -> Dict[str, Any]:
         "major": major,
         "score": _to_int(score),
         "rank": _to_int(rank),
+        "recommend_alternatives": _wants_alternative_majors(message),
     }
 
 
@@ -315,6 +318,15 @@ def _to_int(value: Any) -> Optional[int]:
     return int(match.group(0)) if match else None
 
 
+def _wants_alternative_majors(message: str) -> bool:
+    """识别是否需要从真实录取数据中推荐稳妥搭配专业。"""
+    msg = (message or "").strip()
+    if not msg:
+        return False
+    intent_markers = ["搭配", "稳妥", "更稳", "保底", "备选", "组合", "冲稳保", "推荐专业"]
+    return any(marker in msg for marker in intent_markers)
+
+
 _ADMISSION_RECORDS = load_admission_records(_ADMISSION_SOURCES)
 
 
@@ -348,6 +360,19 @@ def _find_records(province: str, subject_type: str, major: str) -> List[Admissio
     )
 
 
+def _record_to_fact(record: AdmissionRecord) -> Dict[str, Any]:
+    return {
+        "year": record.year,
+        "province": record.province,
+        "subject_type": record.subject_type,
+        "major": record.major,
+        "min_score": record.min_score,
+        "min_rank": record.min_rank,
+        "plan": record.plan,
+        "source": record.source,
+    }
+
+
 def _assess(records: List[AdmissionRecord], params: Dict[str, Any]) -> Dict[str, Any]:
     score = _to_int(params.get("score"))
     rank = int(params["rank"])
@@ -375,7 +400,19 @@ def _assess(records: List[AdmissionRecord], params: Dict[str, Any]) -> Dict[str,
         risk_level = "风险较高"
         suggestion = "从当前已接入数据看位次优势不足，建议作为冲刺项，重点准备更稳和保底方案。"
 
-    return {
+    facts = [_record_to_fact(record) for record in records]
+    derived_claims = {
+        "records_count": len(records),
+        "avg_min_score": avg_score,
+        "avg_min_rank": avg_rank,
+        "stable_years": stable_years,
+        "matched_years": stable_years,
+        "best_rank_margin": best_rank_margin,
+        "risk_level": risk_level,
+        "suggestion": suggestion,
+    }
+
+    result = {
         "status": "ok",
         "risk_level": risk_level,
         "province": params["province"],
@@ -386,15 +423,9 @@ def _assess(records: List[AdmissionRecord], params: Dict[str, Any]) -> Dict[str,
         "avg_min_score": avg_score,
         "avg_min_rank": avg_rank,
         "stable_years": stable_years,
-        "history": [
-            {
-                "year": record.year,
-                "min_score": record.min_score,
-                "min_rank": record.min_rank,
-                "plan": record.plan,
-            }
-            for record in records
-        ],
+        "facts": facts,
+        "derived_claims": derived_claims,
+        "history": facts,
         "reason": _assessment_reason(
             records_count=len(records),
             avg_rank=avg_rank,
@@ -406,6 +437,107 @@ def _assess(records: List[AdmissionRecord], params: Dict[str, Any]) -> Dict[str,
         "suggestion": suggestion,
         "disclaimer": "该判断基于当前已接入的历年数据和简单规则，仅供报考参考；最终以河北工业大学本科招生网和省级招生考试机构公布信息为准。",
     }
+    if params.get("recommend_alternatives"):
+        result["alternative_majors"] = _recommend_alternative_majors(
+            province=str(params["province"]),
+            subject_type=str(params["subject_type"]),
+            current_major=str(params["major"]),
+            rank=rank,
+            score=score,
+            limit=4,
+        )
+        if result["alternative_majors"]:
+            result["alternative_note"] = (
+                "以下搭配专业由当前已接入的同省份、同科类历年录取数据筛选得到；"
+                "只能引用列表中的年份、最低分和最低位次，不得补充列表外专业或编造数据。"
+            )
+        else:
+            result["alternative_note"] = "当前已接入数据不足以自动筛出稳妥搭配专业，建议到本科招生网核对当年招生计划和专业组。"
+    return result
+
+
+def _recommend_alternative_majors(
+    *,
+    province: str,
+    subject_type: str,
+    current_major: str,
+    rank: int,
+    score: Optional[int],
+    limit: int = 4,
+) -> List[Dict[str, Any]]:
+    grouped: Dict[str, List[AdmissionRecord]] = {}
+    for record in _ADMISSION_RECORDS:
+        if record.province != province or record.subject_type != subject_type:
+            continue
+        if record.major == current_major:
+            continue
+        grouped.setdefault(record.major, []).append(record)
+
+    candidates: List[Dict[str, Any]] = []
+    for major, major_records in grouped.items():
+        ordered = sorted(major_records, key=lambda r: r.year, reverse=True)
+        if len(ordered) < 2:
+            continue
+
+        ranks = [record.min_rank for record in ordered]
+        scores = [record.min_score for record in ordered]
+        rank_stable_years = sum(1 for record in ordered if rank <= record.min_rank)
+        score_stable_years = (
+            None if score is None else sum(1 for record in ordered if score >= record.min_score)
+        )
+        if rank_stable_years < len(ordered):
+            continue
+
+        min_rank_margin = min(record.min_rank - rank for record in ordered)
+        avg_rank = int(mean(ranks))
+        avg_score = round(mean(scores), 1)
+        if min_rank_margin >= 2500:
+            level = "相对稳妥"
+        elif min_rank_margin >= 1000:
+            level = "可作为稳妥备选"
+        else:
+            level = "贴近边界，谨慎备选"
+
+        candidates.append({
+            "major": major,
+            "risk_level": level,
+            "special_type": _is_special_major(major),
+            "rank_stable_years": rank_stable_years,
+            "score_stable_years": score_stable_years,
+            "years_count": len(ordered),
+            "min_rank_margin": min_rank_margin,
+            "avg_min_score": avg_score,
+            "avg_min_rank": avg_rank,
+            "facts": [_record_to_fact(record) for record in ordered],
+            "derived_claims": {
+                "records_count": len(ordered),
+                "avg_min_score": avg_score,
+                "avg_min_rank": avg_rank,
+                "rank_stable_years": rank_stable_years,
+                "score_stable_years": score_stable_years,
+                "min_rank_margin": min_rank_margin,
+                "risk_level": level,
+            },
+            "history": [_record_to_fact(record) for record in ordered],
+        })
+
+    candidates.sort(
+        key=lambda item: (
+            bool(item["special_type"]),
+            -int(item["min_rank_margin"]),
+            -int(item["years_count"]),
+            str(item["major"]),
+        )
+    )
+    return candidates[:limit]
+
+
+def _is_special_major(major: str) -> bool:
+    markers = [
+        "中外合作", "芬兰校区", "亚利桑那", "利物浦", "卡普顿",
+        "民族预科", "地方专项", "国家专项", "高校专项", "少数民族",
+    ]
+    return any(marker in major for marker in markers)
 
 
 def _assessment_reason(

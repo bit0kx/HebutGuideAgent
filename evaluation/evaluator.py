@@ -17,6 +17,7 @@ import asyncio
 import json
 import logging
 import pathlib
+import re
 import statistics
 import time
 from dataclasses import asdict, dataclass, field
@@ -128,7 +129,7 @@ Agent 响应: {response}
         response: str,
         context: Optional[str] = None,
     ) -> QualityScores:
-        violation = self._hard_violation(response)
+        violation = self._hard_violation(response, context=context)
         if violation:
             return QualityScores(
                 relevance=0.8,
@@ -176,8 +177,8 @@ Agent 响应: {response}
             value = str(value)
         return value.encode("utf-8", errors="ignore").decode("utf-8")
 
-    @staticmethod
-    def _hard_violation(response: str) -> str:
+    @classmethod
+    def _hard_violation(cls, response: str, context: Optional[str] = None) -> str:
         text = response or ""
         forbidden = [
             "假设工具返回",
@@ -193,7 +194,40 @@ Agent 响应: {response}
         for marker in forbidden:
             if marker in text:
                 return f"响应包含伪造或占位数据标记: {marker}"
+        unsupported_record = cls._unsupported_admission_record(text, context or "")
+        if unsupported_record:
+            return unsupported_record
         return ""
+
+    @classmethod
+    def _unsupported_admission_record(cls, response: str, context: str) -> str:
+        response_records = cls._extract_admission_records(response)
+        if not response_records:
+            return ""
+        context_records = cls._extract_admission_records(context)
+        if not context_records:
+            return "响应包含历年最低分/最低位次，但评测上下文没有可核验的 MCP 或知识库来源"
+
+        missing = sorted(response_records - context_records)
+        if not missing:
+            return ""
+        year, score, rank = missing[0]
+        return (
+            "响应包含未在评测上下文中出现的录取数据: "
+            f"{year} 年最低分 {score}、最低位次 {rank}"
+        )
+
+    @staticmethod
+    def _extract_admission_records(text: str) -> set[tuple[int, int, int]]:
+        records: set[tuple[int, int, int]] = set()
+        pattern = re.compile(
+            r"(20\d{2})\s*年?[^\n。；;]*?"
+            r"最低分\s*[：:]?\s*(\d{3})[^\n。；;]*?"
+            r"最低位次\s*[：:]?\s*(\d{3,7})"
+        )
+        for match in pattern.finditer(text or ""):
+            records.add((int(match.group(1)), int(match.group(2)), int(match.group(3))))
+        return records
 
 
 # ── 意图识别评测 ──────────────────────────────────────────────────────────────
@@ -585,16 +619,30 @@ class EndToEndEvaluator:
 
 DEFAULT_INTENT_CASES: List[IntentTestCase] = [
     IntentTestCase("这个学校在哪个城市？", "school_info"),
+    IntentTestCase("河工大在哪？", "school_info"),
     IntentTestCase("河北工业大学是 211 吗？", "school_info"),
+    IntentTestCase("河北工业大学是不是双一流？", "school_info"),
     IntentTestCase("计算机专业学什么？", "major_info"),
+    IntentTestCase("电气自动化怎么样？", "major_info"),
     IntentTestCase("我河南理科580分能报吗？", "score_risk"),
     IntentTestCase("我河北物理类620分，位次9000，报计算机稳吗？", "score_risk"),
+    IntentTestCase("河北物理类 610，位次 15000，能上电气吗？", "score_risk"),
+    IntentTestCase("620 物理 河北 计算机咋样", "score_risk"),
+    IntentTestCase("河工大计科稳不", "score_risk"),
+    IntentTestCase("我 590 分能上吗？", "score_risk"),
+    IntentTestCase("我是云南考生，想报计算机，稳吗？", "score_risk"),
+    IntentTestCase("河北工业大学有没有网络空间安全专业？这个专业多少分？", "score_risk"),
     IntentTestCase("转专业政策是什么？", "admission_policy"),
     IntentTestCase("服从调剂会被退档吗？", "admission_policy"),
+    IntentTestCase("中外合作专业能转普通专业吗？", "admission_policy"),
+    IntentTestCase("投档后会不会因为单科成绩被退档？", "admission_policy"),
     IntentTestCase("宿舍条件怎么样？", "campus_life"),
     IntentTestCase("学费和住宿费是多少？", "tuition"),
     IntentTestCase("这个专业就业前景如何？", "career"),
     IntentTestCase("软件工程和人工智能怎么选？", "comparison"),
+    IntentTestCase("软工和 AI 怎么选？", "comparison"),
+    IntentTestCase("软件工程和人工智能怎么选？我更看重就业。", "comparison"),
+    IntentTestCase("河北工业大学计算机专业怎么样？我 620 分能报吗？", "score_risk"),
     IntentTestCase("你好，我想咨询报考", "admission_policy"),
     IntentTestCase(
         message="那这个呢？",
@@ -604,6 +652,27 @@ DEFAULT_INTENT_CASES: List[IntentTestCase] = [
                 {"role": "user", "content": "我是河北物理类620分，位次9000，想报计算机科学与技术，稳不稳？"},
                 {"role": "assistant", "content": "需要结合历年最低位次和当年计划判断。"},
                 {"role": "user", "content": "如果换成软件工程"},
+            ],
+        },
+    ),
+    IntentTestCase(
+        message="那软件呢？",
+        expected_intent="score_risk",
+        context={
+            "history": [
+                {"role": "user", "content": "我是河北物理类620分，位次9000，想报计算机科学与技术"},
+                {"role": "assistant", "content": "我可以按目标专业结合历年数据判断。"},
+            ],
+        },
+    ),
+    IntentTestCase(
+        message="哪个更稳？",
+        expected_intent="score_risk",
+        context={
+            "history": [
+                {"role": "user", "content": "河北物理类610分，位次15000"},
+                {"role": "assistant", "content": "请补充目标专业。"},
+                {"role": "user", "content": "计算机和软件工程都考虑"},
             ],
         },
     ),
@@ -625,8 +694,20 @@ DEFAULT_DIALOG_CASES: List[Dict[str, Any]] = [
     {"question": "河北工业大学计算机科学与技术专业主要学什么？"},
     {"question": "河北工业大学转专业政策是什么？"},
     {"question": "天津考生631分、位次6375，报计算机科学与技术稳不稳？"},
+    {"question": "我 580 分能上河北工业大学吗？"},
+    {"question": "河北物理类 615 分，想报电气工程及其自动化，稳吗？"},
+    {"question": "我是云南理科 580，想报计算机科学与技术，稳吗？"},
+    {"question": "河北工业大学有没有网络空间安全专业？这个专业多少分？"},
+    {"question": "服从调剂一定不会退档吗？"},
+    {"question": "投档后会不会因为单科成绩被退档？"},
+    {"question": "色盲色弱能报哪些专业？"},
+    {"question": "河北工业大学计算机专业怎么样？我 620 分能报吗？"},
     {"turns": ["我是河南理科580分", "想报计算机", "稳不稳？"]},
     {"turns": ["我是河北物理类620分，位次9000", "想报计算机科学与技术", "需要搭配什么稳妥专业吗？"]},
     {"turns": ["我比较看重就业", "软件工程和人工智能怎么选？"]},
+    {"turns": ["我是河北物理类 620，位次 9000", "计算机", "那软件工程呢？", "人工智能呢？", "哪个更稳？"]},
+    {"turns": ["我是河北物理类 620，位次 9000，想报计算机。", "不对，我是 610 分，位次 15000。", "那还稳吗？"]},
+    {"turns": ["软件工程就业好吗？", "河北物理 610 位次 14000 稳不稳？"]},
+    {"turns": ["我比较看重就业，也想考研", "软工和 AI 怎么选？", "哪个录取更稳？"]},
 ]
 
