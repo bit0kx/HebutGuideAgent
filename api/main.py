@@ -321,7 +321,7 @@ async def chat(req: ChatRequest):
         tool_manager=_tool_manager,
     )
 
-    # 4. 执行
+    # 4. 选择对应类型agent执行
     result = await _orchestrator.run(orch_req)
 
     # 5. 写入记忆
@@ -339,6 +339,7 @@ async def chat(req: ChatRequest):
         agent_type=result.agent_type.value,
         escalated=result.escalated,
         latency_ms=round(result.latency_ms, 1),
+        # 是否用了 RAG 知识库 或 风险评估工具
         knowledge_used=knowledge_used,
     )
 
@@ -354,20 +355,23 @@ async def _build_orchestrator_request(
 ):
     """共享的请求上下文构建链路，供 /chat 和 CLI 复用。"""
     from agents.agent_orchestrator import Request as OrcReq
-
+    # 读取完整记忆上下文
     mem_ctx = await memory.get_context(user_id, conv_id, query=message)
+    # 取5条Redis 工作记忆里的最近对话消息
     history = [
         {"role": m.role.value, "content": m.content}
         for m in mem_ctx.recent_messages[-5:]
     ] if mem_ctx.recent_messages else None
 
     intent_result = await recognizer.recognize(message, history=history)
+    # RAG 知识库检索结果  走 LLM 查询改写 + 并行检索 + 合并去重 + _rerank 重排
     knowledge_text, knowledge_used = await _build_knowledge_context(
         message,
         history=history,
         intent=intent_result.intent,
         tool_manager=tool_manager,
     )
+    # 录取风险评估工具结果 走 risk_assessment 结构化工具，做分数/位次/专业风险评估
     risk_text, risk_used = await _build_risk_context(
         message,
         history=history,

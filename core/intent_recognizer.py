@@ -118,10 +118,10 @@ class IntentRecognizer:
         self.client    = create_llm_client(api_key=api_key, base_url=base_url, model=model)
         self.model     = model
         self.threshold = confidence_threshold
-        # 第三方兼容 API（如 DeepSeek）通常不支持 Embedding，禁用该策略。
-        # 官方 Anthropic SDK 当前没有 embeddings 资源，因此下面会使用稳定的
-        # 本地字符 n-gram 向量作为轻量兜底，保证三路融合链路真实可跑。
-        self._embedding_enabled = not bool(base_url)
+        # 始终启用第二路向量相似度策略。
+        # 如果当前客户端没有 embeddings.create（第三方兼容 API 常见），
+        # _embed_text() 会退化为稳定的本地字符 n-gram 哈希向量。
+        self._embedding_enabled = True
 
         self._tpl_embeddings: Dict[IntentCategory, List[List[float]]] = {}
         self._cache: Dict[str, IntentResult] = {}
